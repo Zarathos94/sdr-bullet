@@ -1,0 +1,43 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# wasm-bindgen output. Only the generated files are ignored; load.ts beside them is
+# hand-written and tracked.
+/web/src/wasm/sdr_wasm*
+/crates/sdr-wasm/pkg/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+
+# Captures and scratch output from the probe harness. IQ dumps get large fast.
+/captures/
+*.iq
+*.cs8
+*.wav
+
+# Editor and local tooling
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local tooling config
+.claude/
+.cursor/
+.cursorrules
+.aider*
+.continue/
+.windsurfrules
+.github/copilot-instructions.md
+
+# Environment
+.env
+.env.local

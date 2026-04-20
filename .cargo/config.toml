@@ -1,0 +1,9 @@
+# simd128 is enabled globally so LLVM can auto-vectorise ordinary scalar loops and so
+# cfg!(target_feature = "simd128") reports true. The hand-written kernels carry their own
+# #[target_feature(enable = "simd128")] as well — without it the intrinsics still compile
+# but spill v128 values through memory instead of inlining, which costs 3-5x.
+#
+# Note that the RUSTFLAGS environment variable replaces this wholesale rather than merging
+# with it, so CI has to set the flag itself if it sets RUSTFLAGS at all.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

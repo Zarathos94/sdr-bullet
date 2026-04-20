@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sdr-dsp",
+    "crates/sdr-rtl",
+    "crates/sdr-wasm",
+    "crates/sdr-probe",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/Zarathos94/sdr-bullet"
+authors = ["Zarathos94 <irfansaric94@gmail.com>"]
+
+[workspace.dependencies]
+sdr-dsp = { path = "crates/sdr-dsp" }
+sdr-rtl = { path = "crates/sdr-rtl" }
+
+# Pinned exactly: the schema is checked byte-for-byte against the wasm-bindgen CLI,
+# and a semver-compatible bump breaks the build with a version mismatch error.
+wasm-bindgen = "=0.2.100"
+wasm-bindgen-futures = "0.4.50"
+js-sys = "0.3.77"
+web-sys = "0.3.77"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# The wasm bundle ships to browsers over the wire, so size matters more than the
+# last few percent of native-style optimisation.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
