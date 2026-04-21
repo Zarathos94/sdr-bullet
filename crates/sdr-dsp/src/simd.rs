@@ -330,3 +330,166 @@ impl F32x4 {
         Self(imp::abs(self.0))
     }
 
+    /// Fused-looking multiply-add. Baseline wasm SIMD has no FMA — that lives in the
+    /// relaxed-SIMD proposal, which is deliberately non-deterministic across hardware and
+    /// still gated in Safari — so this is a plain multiply followed by an add on every
+    /// backend. Keeping it as one call means the choice is in one place if that changes.
+    #[inline(always)]
+    pub fn mul_add(self, a: Self, b: Self) -> Self {
+        Self(imp::add(imp::mul(self.0, a.0), b.0))
+    }
+
+    #[inline(always)]
+    pub fn sum(self) -> f32 {
+        imp::hsum(self.0)
+    }
+
+    #[inline(always)]
+    pub fn extract(self, lane: usize) -> f32 {
+        debug_assert!(lane < LANES);
+        imp::extract(self.0, lane)
+    }
+
+    #[inline(always)]
+    pub fn to_array(self) -> [f32; LANES] {
+        let mut out = [0.0; LANES];
+        // SAFETY: `out` is exactly four f32 wide.
+        unsafe { imp::store(out.as_mut_ptr(), self.0) };
+        out
+    }
+
+    #[inline(always)]
+    pub fn from_array(a: [f32; LANES]) -> Self {
+        // SAFETY: `a` is exactly four f32 wide.
+        Self(unsafe { imp::load(a.as_ptr()) })
+    }
+}
+
+impl Add for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        Self(imp::add(self.0, rhs.0))
+    }
+}
+
+impl Sub for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        Self(imp::sub(self.0, rhs.0))
+    }
+}
+
+impl Mul for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self {
+        Self(imp::mul(self.0, rhs.0))
+    }
+}
+
+impl Div for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn div(self, rhs: Self) -> Self {
+        Self(imp::div(self.0, rhs.0))
+    }
+}
+
+impl core::fmt::Debug for F32x4 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("F32x4").field(&self.to_array()).finish()
+    }
+}
+
+/// Name of the active backend. Surfaced in the UI's diagnostics panel so a browser
+/// silently falling back to scalar code is visible rather than merely slow.
+pub const fn backend() -> &'static str {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        "wasm-simd128"
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
+    {
+        "x86_64-sse2"
+    }
+    #[cfg(not(any(
+        all(target_arch = "wasm32", target_feature = "simd128"),
+        target_arch = "x86_64"
+    )))]
+    {
+        "scalar"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arithmetic_matches_scalar() {
+        let a = [1.5f32, -2.25, 3.0, 0.5];
+        let b = [0.25f32, 4.0, -1.5, 2.0];
+        let va = F32x4::from_array(a);
+        let vb = F32x4::from_array(b);
+
+        for (i, v) in (va + vb).to_array().iter().enumerate() {
+            assert_eq!(*v, a[i] + b[i]);
+        }
+        for (i, v) in (va - vb).to_array().iter().enumerate() {
+            assert_eq!(*v, a[i] - b[i]);
+        }
+        for (i, v) in (va * vb).to_array().iter().enumerate() {
+            assert_eq!(*v, a[i] * b[i]);
+        }
+        for (i, v) in (va / vb).to_array().iter().enumerate() {
+            assert_eq!(*v, a[i] / b[i]);
+        }
+    }
+
+    #[test]
+    fn hsum_uses_pairwise_association() {
+        let a = [1.0f32, 2.0, 3.0, 4.0];
+        assert_eq!(F32x4::from_array(a).sum(), 10.0);
+
+        // The association order is load-bearing for reproducibility across backends:
+        // (a0+a2) + (a1+a3), not a serial left fold.
+        let b = [1e8f32, 1.0, -1e8, 1.0];
+        assert_eq!(F32x4::from_array(b).sum(), (1e8 + -1e8) + (1.0 + 1.0));
+    }
+
+    #[test]
+    fn min_max_and_abs() {
+        let a = F32x4::from_array([1.0, -2.0, 3.0, -4.0]);
+        let b = F32x4::from_array([-1.0, 2.0, -3.0, 4.0]);
+        assert_eq!(a.min(b).to_array(), [-1.0, -2.0, -3.0, -4.0]);
+        assert_eq!(a.max(b).to_array(), [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(a.abs().to_array(), [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn mul_add_composes() {
+        let a = F32x4::splat(2.0);
+        let b = F32x4::splat(3.0);
+        let c = F32x4::splat(1.0);
+        assert_eq!(a.mul_add(b, c).to_array(), [7.0; 4]);
+    }
+
+    #[test]
+    fn load_store_roundtrip_at_offset() {
+        let src: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let mut dst = vec![0.0f32; 16];
+        for off in [0usize, 1, 5, 12] {
+            F32x4::load(&src, off).store(&mut dst, off);
+            assert_eq!(&dst[off..off + 4], &src[off..off + 4]);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn load_past_end_panics() {
+        let src = [0.0f32; 6];
+        let _ = F32x4::load(&src, 3);
+    }
+}
