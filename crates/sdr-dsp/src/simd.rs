@@ -161,3 +161,172 @@ mod imp {
         unsafe { _mm_sqrt_ps(a) }
     }
 
+    #[inline(always)]
+    pub fn abs(a: Repr) -> Repr {
+        // Clear the sign bit rather than comparing; branch-free and exact.
+        unsafe { _mm_andnot_ps(_mm_set1_ps(-0.0), a) }
+    }
+
+    #[inline(always)]
+    pub fn hsum(a: Repr) -> f32 {
+        unsafe {
+            let hi = _mm_movehl_ps(a, a);
+            let s = _mm_add_ps(a, hi);
+            let hi2 = _mm_shuffle_ps(s, s, 0x55);
+            _mm_cvtss_f32(_mm_add_ss(s, hi2))
+        }
+    }
+
+    #[inline(always)]
+    pub fn extract(a: Repr, i: usize) -> f32 {
+        let mut out = [0.0f32; 4];
+        unsafe { _mm_storeu_ps(out.as_mut_ptr(), a) };
+        out[i]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Portable fallback
+// ---------------------------------------------------------------------------
+
+#[cfg(not(any(
+    all(target_arch = "wasm32", target_feature = "simd128"),
+    target_arch = "x86_64"
+)))]
+mod imp {
+    pub type Repr = [f32; 4];
+
+    #[inline(always)]
+    pub fn splat(v: f32) -> Repr {
+        [v; 4]
+    }
+
+    /// # Safety
+    /// `p` must be valid for reads of 4 `f32`.
+    #[inline(always)]
+    pub unsafe fn load(p: *const f32) -> Repr {
+        unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] }
+    }
+
+    /// # Safety
+    /// `p` must be valid for writes of 4 `f32`.
+    #[inline(always)]
+    pub unsafe fn store(p: *mut f32, v: Repr) {
+        unsafe {
+            *p = v[0];
+            *p.add(1) = v[1];
+            *p.add(2) = v[2];
+            *p.add(3) = v[3];
+        }
+    }
+
+    macro_rules! lanewise {
+        ($name:ident, $op:expr) => {
+            #[inline(always)]
+            pub fn $name(a: Repr, b: Repr) -> Repr {
+                let f: fn(f32, f32) -> f32 = $op;
+                [f(a[0], b[0]), f(a[1], b[1]), f(a[2], b[2]), f(a[3], b[3])]
+            }
+        };
+    }
+
+    lanewise!(add, |x, y| x + y);
+    lanewise!(sub, |x, y| x - y);
+    lanewise!(mul, |x, y| x * y);
+    lanewise!(div, |x, y| x / y);
+    lanewise!(min, |x: f32, y: f32| if x < y { x } else { y });
+    lanewise!(max, |x: f32, y: f32| if x > y { x } else { y });
+
+    #[inline(always)]
+    pub fn sqrt(a: Repr) -> Repr {
+        [a[0].sqrt(), a[1].sqrt(), a[2].sqrt(), a[3].sqrt()]
+    }
+    #[inline(always)]
+    pub fn abs(a: Repr) -> Repr {
+        [a[0].abs(), a[1].abs(), a[2].abs(), a[3].abs()]
+    }
+
+    #[inline(always)]
+    pub fn hsum(a: Repr) -> f32 {
+        // Same pairwise association as the vector backends so results match bit for bit.
+        (a[0] + a[2]) + (a[1] + a[3])
+    }
+
+    #[inline(always)]
+    pub fn extract(a: Repr, i: usize) -> f32 {
+        a[i]
+    }
+}
+
+use imp::Repr;
+
+impl F32x4 {
+    pub const LANES: usize = LANES;
+
+    #[inline(always)]
+    pub fn splat(v: f32) -> Self {
+        Self(imp::splat(v))
+    }
+
+    #[inline(always)]
+    pub fn zero() -> Self {
+        Self::splat(0.0)
+    }
+
+    /// Loads four lanes starting at `slice[offset]`.
+    ///
+    /// # Panics
+    /// If fewer than four elements remain after `offset`.
+    #[inline(always)]
+    pub fn load(slice: &[f32], offset: usize) -> Self {
+        assert!(offset + LANES <= slice.len(), "F32x4::load out of bounds");
+        // SAFETY: bounds checked directly above.
+        Self(unsafe { imp::load(slice.as_ptr().add(offset)) })
+    }
+
+    /// Loads four lanes without bounds checking.
+    ///
+    /// # Safety
+    /// `offset + 4 <= slice.len()`.
+    #[inline(always)]
+    pub unsafe fn load_unchecked(slice: &[f32], offset: usize) -> Self {
+        Self(unsafe { imp::load(slice.as_ptr().add(offset)) })
+    }
+
+    /// Stores four lanes starting at `slice[offset]`.
+    ///
+    /// # Panics
+    /// If fewer than four elements remain after `offset`.
+    #[inline(always)]
+    pub fn store(self, slice: &mut [f32], offset: usize) {
+        assert!(offset + LANES <= slice.len(), "F32x4::store out of bounds");
+        // SAFETY: bounds checked directly above.
+        unsafe { imp::store(slice.as_mut_ptr().add(offset), self.0) }
+    }
+
+    /// Stores four lanes without bounds checking.
+    ///
+    /// # Safety
+    /// `offset + 4 <= slice.len()`.
+    #[inline(always)]
+    pub unsafe fn store_unchecked(self, slice: &mut [f32], offset: usize) {
+        unsafe { imp::store(slice.as_mut_ptr().add(offset), self.0) }
+    }
+
+    #[inline(always)]
+    pub fn min(self, other: Self) -> Self {
+        Self(imp::min(self.0, other.0))
+    }
+    #[inline(always)]
+    pub fn max(self, other: Self) -> Self {
+        Self(imp::max(self.0, other.0))
+    }
+    #[inline(always)]
+    pub fn sqrt(self) -> Self {
+        Self(imp::sqrt(self.0))
+    }
+    #[inline(always)]
+    pub fn abs(self) -> Self {
+        Self(imp::abs(self.0))
+    }
+
