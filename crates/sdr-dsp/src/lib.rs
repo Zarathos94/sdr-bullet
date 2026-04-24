@@ -9,8 +9,11 @@
 //! after that treats complex arithmetic as parallel real arithmetic. This costs one pass
 //! and removes lane shuffles from every subsequent kernel.
 
+pub mod iq;
 pub mod simd;
+pub mod window;
 
+pub use iq::IqConverter;
 pub use simd::F32x4;
 
 // The wasm32 SIMD backend is selected by `cfg(target_feature = "simd128")`. If the
