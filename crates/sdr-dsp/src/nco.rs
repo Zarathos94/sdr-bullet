@@ -185,3 +185,174 @@ pub fn complex_multiply_in_place(i: &mut [f32], q: &mut [f32], c: &[f32], s: &[f
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::f32::consts::TAU;
+
+    const SR: f64 = 48_000.0;
+
+    #[test]
+    fn table_reproduces_sine_accurately() {
+        let t = SineTable::new();
+        for k in 0..1000 {
+            let turns = k as f64 / 1000.0;
+            let phase = (turns * 4294967296.0) as u64 as u32;
+            let expected = (turns * core::f64::consts::TAU).sin() as f32;
+            assert!(
+                (t.sin_at(phase) - expected).abs() < 1e-4,
+                "sine mismatch at turn {turns}"
+            );
+        }
+    }
+
+    #[test]
+    fn cosine_leads_sine_by_a_quarter_cycle() {
+        let t = SineTable::new();
+        for k in 0..500 {
+            let phase = (k as u64 * 8_000_000) as u32;
+            let expected = (phase as f64 / 4294967296.0 * core::f64::consts::TAU).cos() as f32;
+            assert!((t.cos_at(phase) - expected).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn frequency_survives_a_roundtrip() {
+        let mut nco = Nco::new(SR);
+        for hz in [0.0, 1.0, 1000.0, -1000.0, 23_999.0] {
+            nco.set_frequency(hz);
+            assert!(
+                (nco.frequency() - hz).abs() < 0.001,
+                "wanted {hz}, got {}",
+                nco.frequency()
+            );
+        }
+    }
+
+    #[test]
+    fn generates_a_tone_at_the_requested_rate() {
+        let mut nco = Nco::new(SR);
+        nco.set_frequency(1000.0);
+        let n = 480;
+        let mut c = vec![0.0; n];
+        let mut s = vec![0.0; n];
+        nco.generate(&mut c, &mut s);
+
+        // Ten full cycles of a 1 kHz tone fit in 480 samples at 48 kHz.
+        for k in 0..n {
+            let expected = (TAU * 1000.0 * k as f32 / SR as f32).cos();
+            assert!((c[k] - expected).abs() < 1e-3, "cos mismatch at {k}");
+        }
+    }
+
+    #[test]
+    fn quadrature_outputs_stay_on_the_unit_circle() {
+        let mut nco = Nco::new(SR);
+        nco.set_frequency(7333.0);
+        let mut c = vec![0.0; 4096];
+        let mut s = vec![0.0; 4096];
+        nco.generate(&mut c, &mut s);
+        for k in 0..4096 {
+            let mag = (c[k] * c[k] + s[k] * s[k]).sqrt();
+            assert!((mag - 1.0).abs() < 1e-3, "magnitude {mag} at {k}");
+        }
+    }
+
+    #[test]
+    fn mixing_down_by_the_signal_frequency_lands_it_at_dc() {
+        let n = 4096;
+        let tone = 5000.0f32;
+
+        let mut i: Vec<f32> = (0..n)
+            .map(|k| (TAU * tone * k as f32 / SR as f32).cos())
+            .collect();
+        let mut q: Vec<f32> = (0..n)
+            .map(|k| (TAU * tone * k as f32 / SR as f32).sin())
+            .collect();
+
+        let mut nco = Nco::new(SR);
+        nco.set_frequency(tone as f64);
+        nco.mix_down(&mut i, &mut q);
+
+        // A complex exponential mixed down by its own frequency becomes a constant.
+        for k in 0..n {
+            assert!((i[k] - 1.0).abs() < 5e-3, "I not flat at {k}: {}", i[k]);
+            assert!(q[k].abs() < 5e-3, "Q not zero at {k}: {}", q[k]);
+        }
+    }
+
+    #[test]
+    fn mixing_up_then_down_restores_the_input() {
+        let n = 1024;
+        let orig_i: Vec<f32> = (0..n).map(|k| (k as f32 * 0.05).cos()).collect();
+        let orig_q: Vec<f32> = (0..n).map(|k| (k as f32 * 0.05).sin()).collect();
+        let mut i = orig_i.clone();
+        let mut q = orig_q.clone();
+
+        let mut up = Nco::new(SR);
+        up.set_frequency(3000.0);
+        up.mix_up(&mut i, &mut q);
+
+        let mut down = Nco::new(SR);
+        down.set_frequency(3000.0);
+        down.mix_down(&mut i, &mut q);
+
+        for k in 0..n {
+            assert!((i[k] - orig_i[k]).abs() < 1e-3, "I drift at {k}");
+            assert!((q[k] - orig_q[k]).abs() < 1e-3, "Q drift at {k}");
+        }
+    }
+
+    #[test]
+    fn negative_frequency_rotates_the_opposite_way() {
+        let mut a = Nco::new(SR);
+        a.set_frequency(1000.0);
+        let mut b = Nco::new(SR);
+        b.set_frequency(-1000.0);
+
+        let (mut ca, mut sa) = (vec![0.0; 64], vec![0.0; 64]);
+        let (mut cb, mut sb) = (vec![0.0; 64], vec![0.0; 64]);
+        a.generate(&mut ca, &mut sa);
+        b.generate(&mut cb, &mut sb);
+
+        for k in 0..64 {
+            assert!((ca[k] - cb[k]).abs() < 1e-4, "cosine should be even");
+            assert!((sa[k] + sb[k]).abs() < 1e-4, "sine should be odd");
+        }
+    }
+
+    #[test]
+    fn phase_accumulator_wraps_without_drifting() {
+        // Half a million samples is far past where a recursive rotator would visibly decay.
+        let mut nco = Nco::new(SR);
+        nco.set_frequency(11_000.0);
+        let mut c = vec![0.0; 8192];
+        let mut s = vec![0.0; 8192];
+        for _ in 0..64 {
+            nco.generate(&mut c, &mut s);
+        }
+        for k in 0..8192 {
+            let mag = (c[k] * c[k] + s[k] * s[k]).sqrt();
+            assert!((mag - 1.0).abs() < 1e-3, "amplitude drifted to {mag}");
+        }
+    }
+
+    #[test]
+    fn complex_multiply_handles_lengths_that_straddle_the_vector_width() {
+        for n in [1usize, 3, 4, 7, 8, 13, 64] {
+            let mut i: Vec<f32> = (0..n).map(|k| k as f32).collect();
+            let mut q: Vec<f32> = (0..n).map(|k| -(k as f32)).collect();
+            let c = vec![0.0f32; n];
+            let s = vec![1.0f32; n];
+
+            let want_i: Vec<f32> = (0..n).map(|k| k as f32).collect();
+            complex_multiply_in_place(&mut i, &mut q, &c, &s);
+
+            // Multiplying by j maps (a + jb) to (-b + ja).
+            for k in 0..n {
+                assert!((i[k] - want_i[k]).abs() < 1e-6, "n={n} k={k}");
+                assert!((q[k] - k as f32).abs() < 1e-6, "n={n} k={k}");
+            }
+        }
+    }
+}
