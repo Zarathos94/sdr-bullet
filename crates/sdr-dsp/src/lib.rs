@@ -10,10 +10,12 @@
 //! and removes lane shuffles from every subsequent kernel.
 
 pub mod iq;
+pub mod nco;
 pub mod simd;
 pub mod window;
 
 pub use iq::IqConverter;
+pub use nco::Nco;
 pub use simd::F32x4;
 
 // The wasm32 SIMD backend is selected by `cfg(target_feature = "simd128")`. If the
