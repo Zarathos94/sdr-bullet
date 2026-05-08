@@ -9,11 +9,13 @@
 //! after that treats complex arithmetic as parallel real arithmetic. This costs one pass
 //! and removes lane shuffles from every subsequent kernel.
 
+pub mod fft;
 pub mod iq;
 pub mod nco;
 pub mod simd;
 pub mod window;
 
+pub use fft::Fft;
 pub use iq::IqConverter;
 pub use nco::Nco;
 pub use simd::F32x4;
