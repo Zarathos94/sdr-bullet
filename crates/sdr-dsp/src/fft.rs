@@ -366,3 +366,181 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_bin_centred_tone_lands_on_exactly_that_bin() {
+        let n = 256;
+        for target in [1usize, 7, 64, 200] {
+            let mut re: Vec<f32> = (0..n)
+                .map(|t| (TAU * target as f32 * t as f32 / n as f32).cos())
+                .collect();
+            let mut im: Vec<f32> = (0..n)
+                .map(|t| (TAU * target as f32 * t as f32 / n as f32).sin())
+                .collect();
+            Fft::new(n).forward(&mut re, &mut im);
+
+            let mag: Vec<f32> = (0..n)
+                .map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt())
+                .collect();
+            let peak = mag
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0;
+            assert_eq!(peak, target, "expected peak at {target}");
+            assert!((mag[target] - n as f32).abs() < 0.1);
+        }
+    }
+
+    #[test]
+    fn preserves_energy_as_parseval_requires() {
+        let n = 512;
+        let (re, im) = pseudo_random(n);
+        let time_energy: f64 = re
+            .iter()
+            .zip(&im)
+            .map(|(r, i)| (*r as f64).powi(2) + (*i as f64).powi(2))
+            .sum();
+
+        let mut fr = re.clone();
+        let mut fi = im.clone();
+        Fft::new(n).forward(&mut fr, &mut fi);
+        let freq_energy: f64 = fr
+            .iter()
+            .zip(&fi)
+            .map(|(r, i)| (*r as f64).powi(2) + (*i as f64).powi(2))
+            .sum();
+
+        // Sum of squared magnitudes scales by n across the transform.
+        let ratio = freq_energy / (time_energy * n as f64);
+        assert!((ratio - 1.0).abs() < 1e-3, "energy ratio {ratio}");
+    }
+
+    #[test]
+    fn inverse_undoes_forward() {
+        for &n in &[8usize, 64, 1024] {
+            let (re, im) = pseudo_random(n);
+            let mut wr = re.clone();
+            let mut wi = im.clone();
+
+            let plan = Fft::new(n);
+            plan.forward(&mut wr, &mut wi);
+            plan.inverse(&mut wr, &mut wi);
+
+            for k in 0..n {
+                assert!((wr[k] - re[k]).abs() < 1e-4, "n={n} real drift at {k}");
+                assert!((wi[k] - im[k]).abs() < 1e-4, "n={n} imag drift at {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn linearity_holds() {
+        let n = 128;
+        let (ar, ai) = pseudo_random(n);
+        let (br, bi) = pseudo_random(n);
+        let plan = Fft::new(n);
+
+        let mut sum_r: Vec<f32> = ar.iter().zip(&br).map(|(x, y)| x + y).collect();
+        let mut sum_i: Vec<f32> = ai.iter().zip(&bi).map(|(x, y)| x + y).collect();
+        plan.forward(&mut sum_r, &mut sum_i);
+
+        let (mut fa_r, mut fa_i) = (ar.clone(), ai.clone());
+        let (mut fb_r, mut fb_i) = (br.clone(), bi.clone());
+        plan.forward(&mut fa_r, &mut fa_i);
+        plan.forward(&mut fb_r, &mut fb_i);
+
+        for k in 0..n {
+            assert!((sum_r[k] - (fa_r[k] + fb_r[k])).abs() < 1e-3, "bin {k}");
+            assert!((sum_i[k] - (fa_i[k] + fb_i[k])).abs() < 1e-3, "bin {k}");
+        }
+    }
+
+    #[test]
+    fn vector_and_scalar_butterflies_agree() {
+        // Size 8 exercises half-blocks of 1 and 2 (scalar) then 4 (vector), so a
+        // disagreement between the two paths shows up as a wrong transform.
+        let n = 8;
+        let (re, im) = pseudo_random(n);
+        let (want_re, want_im) = naive_dft(&re, &im);
+        let mut gr = re.clone();
+        let mut gi = im.clone();
+        Fft::new(n).forward(&mut gr, &mut gi);
+        for k in 0..n {
+            assert!((gr[k] - want_re[k]).abs() < 1e-4, "bin {k}");
+            assert!((gi[k] - want_im[k]).abs() < 1e-4, "bin {k}");
+        }
+    }
+
+    #[test]
+    fn full_scale_tone_reads_zero_db() {
+        let n = 1024;
+        let win = window::Window::Hann.periodic(n);
+        let plan = Fft::new(n);
+
+        // Unit-amplitude complex exponential parked on bin 100.
+        let mut re: Vec<f32> = (0..n)
+            .map(|t| (TAU * 100.0 * t as f32 / n as f32).cos() * win[t])
+            .collect();
+        let mut im: Vec<f32> = (0..n)
+            .map(|t| (TAU * 100.0 * t as f32 / n as f32).sin() * win[t])
+            .collect();
+        plan.forward(&mut re, &mut im);
+
+        let mut db = vec![0.0; n];
+        plan.power_db(&re, &im, &win, &mut db);
+        assert!(
+            db[100].abs() < 0.2,
+            "expected roughly 0 dB, got {}",
+            db[100]
+        );
+    }
+
+    #[test]
+    fn silence_reads_the_floor_rather_than_negative_infinity() {
+        let n = 64;
+        let win = window::Window::Hann.periodic(n);
+        let plan = Fft::new(n);
+        let (re, im) = (vec![0.0f32; n], vec![0.0f32; n]);
+        let mut db = vec![0.0; n];
+        plan.power_db(&re, &im, &win, &mut db);
+        for v in &db {
+            assert!(v.is_finite(), "power_db produced {v}");
+            assert!(*v < -150.0);
+        }
+    }
+
+    #[test]
+    fn magnitude_agrees_with_the_direct_computation() {
+        let n = 64;
+        let (re, im) = pseudo_random(n);
+        let mut out = vec![0.0; n];
+        Fft::new(n).magnitude(&re, &im, &mut out);
+        for k in 0..n {
+            let want = (re[k] * re[k] + im[k] * im[k]).sqrt();
+            assert!((out[k] - want).abs() < 1e-6, "bin {k}");
+        }
+    }
+
+    #[test]
+    fn shift_moves_dc_to_the_middle() {
+        let mut bins: Vec<f32> = (0..8).map(|k| k as f32).collect();
+        shift(&mut bins);
+        assert_eq!(bins, vec![4.0, 5.0, 6.0, 7.0, 0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn rejects_a_non_power_of_two() {
+        Fft::new(100);
+    }
+
+    #[test]
+    #[should_panic(expected = "must match the plan size")]
+    fn rejects_a_mismatched_buffer() {
+        let plan = Fft::new(16);
+        let mut re = vec![0.0; 8];
+        let mut im = vec![0.0; 8];
+        plan.forward(&mut re, &mut im);
+    }
+}
