@@ -174,3 +174,195 @@ impl Fft {
         }
     }
 
+    /// Magnitude of each bin, without normalisation or a logarithm.
+    ///
+    /// # Panics
+    /// If `out` is shorter than the plan size.
+    pub fn magnitude(&self, re: &[f32], im: &[f32], out: &mut [f32]) {
+        assert!(out.len() >= self.n, "output buffer too short");
+        let chunks = self.n / LANES;
+        for c in 0..chunks {
+            let off = c * LANES;
+            // SAFETY: `off + LANES <= n`, and all three buffers are at least `n` long.
+            unsafe {
+                let r = F32x4::load_unchecked(re, off);
+                let i = F32x4::load_unchecked(im, off);
+                (r * r + i * i).sqrt().store_unchecked(out, off);
+            }
+        }
+        for k in chunks * LANES..self.n {
+            out[k] = (re[k] * re[k] + im[k] * im[k]).sqrt();
+        }
+    }
+}
+
+impl core::fmt::Debug for Fft {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Fft")
+            .field("n", &self.n)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Rotates a spectrum so negative frequencies come first and DC lands in the middle.
+///
+/// Complex input produces a two-sided spectrum with DC in bin zero and negative
+/// frequencies in the upper half. A waterfall wants them laid out left to right.
+///
+/// # Panics
+/// If `bins` has odd length.
+pub fn shift(bins: &mut [f32]) {
+    assert!(bins.len() % 2 == 0, "spectrum length must be even to shift");
+    let half = bins.len() / 2;
+    let (lo, hi) = bins.split_at_mut(half);
+    lo.swap_with_slice(hi);
+}
+
+/// Butterfly over four bins at a time. Requires `a.len() >= LANES`.
+fn butterfly_vector(
+    a_re: &mut [f32],
+    a_im: &mut [f32],
+    b_re: &mut [f32],
+    b_im: &mut [f32],
+    tw_re: &[f32],
+    tw_im: &[f32],
+) {
+    let h = a_re.len();
+    let chunks = h / LANES;
+    for c in 0..chunks {
+        let off = c * LANES;
+        // SAFETY: `off + LANES <= h`, and every slice here is exactly `h` long.
+        unsafe {
+            let wr = F32x4::load_unchecked(tw_re, off);
+            let wi = F32x4::load_unchecked(tw_im, off);
+            let br = F32x4::load_unchecked(b_re, off);
+            let bi = F32x4::load_unchecked(b_im, off);
+
+            // t = w * b
+            let tr = wr * br - wi * bi;
+            let ti = wr * bi + wi * br;
+
+            let ar = F32x4::load_unchecked(a_re, off);
+            let ai = F32x4::load_unchecked(a_im, off);
+
+            (ar + tr).store_unchecked(a_re, off);
+            (ai + ti).store_unchecked(a_im, off);
+            (ar - tr).store_unchecked(b_re, off);
+            (ai - ti).store_unchecked(b_im, off);
+        }
+    }
+    if chunks * LANES < h {
+        let rest = chunks * LANES;
+        butterfly_scalar(
+            &mut a_re[rest..],
+            &mut a_im[rest..],
+            &mut b_re[rest..],
+            &mut b_im[rest..],
+            &tw_re[rest..],
+            &tw_im[rest..],
+        );
+    }
+}
+
+fn butterfly_scalar(
+    a_re: &mut [f32],
+    a_im: &mut [f32],
+    b_re: &mut [f32],
+    b_im: &mut [f32],
+    tw_re: &[f32],
+    tw_im: &[f32],
+) {
+    for j in 0..a_re.len() {
+        let (wr, wi) = (tw_re[j], tw_im[j]);
+        let (br, bi) = (b_re[j], b_im[j]);
+        let tr = wr * br - wi * bi;
+        let ti = wr * bi + wi * br;
+        let (ar, ai) = (a_re[j], a_im[j]);
+        a_re[j] = ar + tr;
+        a_im[j] = ai + ti;
+        b_re[j] = ar - tr;
+        b_im[j] = ai - ti;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::f32::consts::TAU;
+
+    /// Direct evaluation of the transform definition. Quadratic, so only for small sizes,
+    /// but it depends on none of the machinery under test.
+    fn naive_dft(re: &[f32], im: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let n = re.len();
+        let mut out_re = vec![0.0; n];
+        let mut out_im = vec![0.0; n];
+        for k in 0..n {
+            let (mut sr, mut si) = (0.0f64, 0.0f64);
+            for t in 0..n {
+                let ang = -core::f64::consts::TAU * (k as f64) * (t as f64) / n as f64;
+                let (c, s) = (ang.cos(), ang.sin());
+                sr += re[t] as f64 * c - im[t] as f64 * s;
+                si += re[t] as f64 * s + im[t] as f64 * c;
+            }
+            out_re[k] = sr as f32;
+            out_im[k] = si as f32;
+        }
+        (out_re, out_im)
+    }
+
+    fn pseudo_random(n: usize) -> (Vec<f32>, Vec<f32>) {
+        // A deterministic, poorly-correlated sequence. Good enough to catch index errors
+        // and avoids pulling in a dependency for a handful of numbers.
+        let mut state = 0x2545_F491u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let re = (0..n).map(|_| next()).collect();
+        let im = (0..n).map(|_| next()).collect();
+        (re, im)
+    }
+
+    #[test]
+    fn matches_the_definition_across_sizes() {
+        for &n in &[2usize, 4, 8, 16, 32, 64, 128, 256] {
+            let (re, im) = pseudo_random(n);
+            let (want_re, want_im) = naive_dft(&re, &im);
+
+            let mut got_re = re.clone();
+            let mut got_im = im.clone();
+            Fft::new(n).forward(&mut got_re, &mut got_im);
+
+            // Error grows with the number of stages, hence the size-dependent tolerance.
+            let tol = 1e-4 * n as f32;
+            for k in 0..n {
+                assert!(
+                    (got_re[k] - want_re[k]).abs() < tol && (got_im[k] - want_im[k]).abs() < tol,
+                    "n={n} bin {k}: got ({}, {}) want ({}, {})",
+                    got_re[k],
+                    got_im[k],
+                    want_re[k],
+                    want_im[k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dc_input_puts_all_energy_in_bin_zero() {
+        let n = 64;
+        let mut re = vec![1.0f32; n];
+        let mut im = vec![0.0f32; n];
+        Fft::new(n).forward(&mut re, &mut im);
+
+        assert!((re[0] - n as f32).abs() < 1e-3);
+        for k in 1..n {
+            assert!(
+                re[k].abs() < 1e-3 && im[k].abs() < 1e-3,
+                "leakage into bin {k}"
+            );
+        }
+    }
+
