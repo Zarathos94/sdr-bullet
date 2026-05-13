@@ -10,12 +10,14 @@
 //! and removes lane shuffles from every subsequent kernel.
 
 pub mod fft;
+pub mod fir;
 pub mod iq;
 pub mod nco;
 pub mod simd;
 pub mod window;
 
 pub use fft::Fft;
+pub use fir::{Decimator, Fir, HalfBand};
 pub use iq::IqConverter;
 pub use nco::Nco;
 pub use simd::F32x4;
