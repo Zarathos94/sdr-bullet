@@ -251,3 +251,252 @@ pub struct HalfBand {
     phase: usize,
 }
 
+impl HalfBand {
+    /// Builds a half-band stage from a design of `taps` length.
+    ///
+    /// # Panics
+    /// If `taps` is not of the form `4k + 3`, which is what makes the zero pattern land
+    /// correctly around an integer centre.
+    pub fn new(taps: usize) -> Self {
+        assert!(
+            taps >= 7 && taps % 4 == 3,
+            "half-band length must be 4k+3, got {taps}"
+        );
+        let full = design_halfband(taps);
+        let centre_idx = taps / 2;
+        let centre = full[centre_idx];
+
+        // Taps at odd offsets from the centre are the only nonzero ones off-centre.
+        let mut odd_taps = Vec::new();
+        let mut idx = 1usize;
+        while idx <= centre_idx {
+            if idx % 2 == 1 {
+                odd_taps.push(full[centre_idx - idx]);
+            }
+            idx += 1;
+        }
+        // Reverse so the loop walks the scratch buffer forward.
+        odd_taps.reverse();
+
+        Self {
+            odd_taps,
+            centre,
+            half_span: centre_idx,
+            history: vec![0.0; taps - 1],
+            scratch: Vec::new(),
+            ntaps: taps,
+            phase: 0,
+        }
+    }
+
+    pub fn taps(&self) -> usize {
+        self.ntaps
+    }
+
+    pub fn output_len(&self, n: usize) -> usize {
+        n.div_ceil(2)
+    }
+
+    pub fn reset(&mut self) {
+        self.history.fill(0.0);
+        self.phase = 0;
+    }
+
+    /// Returns the number of output samples written.
+    ///
+    /// # Panics
+    /// If `output` cannot hold [`HalfBand::output_len`] samples.
+    pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+        assert!(
+            output.len() >= self.output_len(input.len()),
+            "output buffer too short"
+        );
+        let hist = self.ntaps - 1;
+
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&self.history);
+        self.scratch.extend_from_slice(input);
+
+        let mut written = 0;
+        let mut k = self.phase;
+        while k < input.len() {
+            let w = &self.scratch[k..k + self.ntaps];
+            // Pair up samples equidistant from the centre: the filter is symmetric, so
+            // each tap multiplies a sum rather than two separate products.
+            let mut acc = self.centre * w[self.half_span];
+            for (t, tap) in self.odd_taps.iter().enumerate() {
+                // odd_taps was reversed, so index t counts inwards from the outermost tap.
+                let offset = self.half_span - (2 * (self.odd_taps.len() - 1 - t) + 1);
+                acc += tap * (w[offset] + w[self.ntaps - 1 - offset]);
+            }
+            output[written] = acc;
+            written += 1;
+            k += 2;
+        }
+        self.phase = k - input.len();
+
+        let tail = self.scratch.len().saturating_sub(hist);
+        self.history.clear();
+        self.history.extend_from_slice(&self.scratch[tail..]);
+        while self.history.len() < hist {
+            self.history.insert(0, 0.0);
+        }
+
+        written
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filter design
+// ---------------------------------------------------------------------------
+
+/// Windowed-sinc low-pass. `cutoff` is in cycles per sample, so 0.5 is Nyquist.
+///
+/// Taps are normalised for unit gain at DC, which keeps a cascade of stages from
+/// accumulating a level change.
+///
+/// # Panics
+/// If `taps` is even or zero, or `cutoff` is outside `(0, 0.5)`.
+pub fn design_lowpass(taps: usize, cutoff: f32, window: Window) -> Vec<f32> {
+    assert!(
+        taps % 2 == 1 && taps > 0,
+        "use an odd tap count for a linear-phase filter"
+    );
+    assert!(
+        cutoff > 0.0 && cutoff < 0.5,
+        "cutoff must be in (0, 0.5), got {cutoff}"
+    );
+
+    let w = window.symmetric(taps);
+    let centre = (taps / 2) as f32;
+    let mut h: Vec<f32> = (0..taps)
+        .map(|k| {
+            let x = k as f32 - centre;
+            let ideal = if x.abs() < 1e-6 {
+                // sinc's removable singularity at zero.
+                2.0 * cutoff
+            } else {
+                (core::f32::consts::TAU * cutoff * x).sin() / (core::f32::consts::PI * x)
+            };
+            ideal * w[k]
+        })
+        .collect();
+
+    let sum: f32 = h.iter().sum();
+    if sum.abs() > 1e-12 {
+        for v in &mut h {
+            *v /= sum;
+        }
+    }
+    h
+}
+
+/// Half-band low-pass: cutoff fixed at a quarter of the sample rate.
+///
+/// The zeros are forced exactly rather than left to rounding, because [`HalfBand`] skips
+/// those positions entirely and a residual value there would silently be dropped.
+///
+/// # Panics
+/// If `taps` is not of the form `4k + 3`.
+pub fn design_halfband(taps: usize) -> Vec<f32> {
+    assert!(taps % 4 == 3, "half-band length must be 4k+3, got {taps}");
+    let mut h = design_lowpass(taps, 0.25, Window::kaiser(8.6));
+    let centre = taps / 2;
+    for (k, v) in h.iter_mut().enumerate() {
+        let offset = k as isize - centre as isize;
+        if offset != 0 && offset % 2 == 0 {
+            *v = 0.0;
+        }
+    }
+    // Renormalise, since zeroing taps disturbs the DC gain.
+    let sum: f32 = h.iter().sum();
+    for v in &mut h {
+        *v /= sum;
+    }
+    h
+}
+
+/// Band-pass built by modulating a low-pass prototype up to the band centre.
+///
+/// # Panics
+/// If the band is not inside `(0, 0.5)` or `low >= high`.
+pub fn design_bandpass(taps: usize, low: f32, high: f32, window: Window) -> Vec<f32> {
+    assert!(low < high, "low cutoff must be below high cutoff");
+    assert!(low > 0.0 && high < 0.5, "band must lie inside (0, 0.5)");
+
+    let centre_freq = (low + high) / 2.0;
+    let half_width = (high - low) / 2.0;
+    let proto = design_lowpass(taps, half_width, window);
+    let centre = (taps / 2) as f32;
+
+    // Multiplying by a cosine shifts the prototype's response to sit either side of it.
+    // The factor of two restores the gain that splitting into two images halves.
+    proto
+        .iter()
+        .enumerate()
+        .map(|(k, v)| {
+            let x = k as f32 - centre;
+            2.0 * v * (core::f32::consts::TAU * centre_freq * x).cos()
+        })
+        .collect()
+}
+
+/// Hilbert transformer: a 90-degree phase shift across most of the band.
+///
+/// Antisymmetric, with zeros at every even offset from the centre. Pair it with a delay of
+/// `taps / 2` on the in-phase branch to build an analytic signal.
+///
+/// # Panics
+/// If `taps` is even.
+pub fn design_hilbert(taps: usize, window: Window) -> Vec<f32> {
+    assert!(taps % 2 == 1, "Hilbert transformer needs an odd tap count");
+    let w = window.symmetric(taps);
+    let centre = (taps / 2) as isize;
+    (0..taps)
+        .map(|k| {
+            let n = k as isize - centre;
+            if n == 0 || n % 2 == 0 {
+                0.0
+            } else {
+                (2.0 / (core::f32::consts::PI * n as f32)) * w[k]
+            }
+        })
+        .collect()
+}
+
+/// Response of a filter at a normalised frequency, in cycles per sample.
+///
+/// Used by the tests to assert passband and stopband behaviour rather than eyeballing taps.
+pub fn response_at(taps: &[f32], freq: f32) -> f32 {
+    let (mut re, mut im) = (0.0f64, 0.0f64);
+    for (k, tap) in taps.iter().enumerate() {
+        let ang = -core::f64::consts::TAU * freq as f64 * k as f64;
+        re += *tap as f64 * ang.cos();
+        im += *tap as f64 * ang.sin();
+    }
+    (re * re + im * im).sqrt() as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db(x: f32) -> f32 {
+        20.0 * (x.max(1e-12)).log10()
+    }
+
+    #[test]
+    fn dot_matches_the_naive_sum_at_every_length() {
+        // Lengths chosen to straddle the 16-wide unrolled block and the 4-wide remainder.
+        for n in [1usize, 3, 4, 5, 15, 16, 17, 31, 32, 33, 64, 100] {
+            let a: Vec<f32> = (0..n).map(|k| (k as f32 * 0.37).sin()).collect();
+            let b: Vec<f32> = (0..n).map(|k| (k as f32 * 0.11).cos()).collect();
+            let want: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+            let got = dot(&a, &b);
+            assert!(
+                (got - want).abs() < 1e-3 * n as f32,
+                "n={n}: {got} vs {want}"
+            );
+        }
+    }
+
