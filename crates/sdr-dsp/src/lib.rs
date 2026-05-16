@@ -9,6 +9,7 @@
 //! after that treats complex arithmetic as parallel real arithmetic. This costs one pass
 //! and removes lane shuffles from every subsequent kernel.
 
+pub mod agc;
 pub mod fft;
 pub mod fir;
 pub mod iq;
@@ -16,6 +17,7 @@ pub mod nco;
 pub mod simd;
 pub mod window;
 
+pub use agc::{Agc, Deemphasis, Emphasis};
 pub use fft::Fft;
 pub use fir::{Decimator, Fir, HalfBand};
 pub use iq::IqConverter;
