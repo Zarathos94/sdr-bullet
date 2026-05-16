@@ -500,3 +500,246 @@ mod tests {
         }
     }
 
+    #[test]
+    fn impulse_response_reproduces_the_taps() {
+        let taps = vec![0.1, 0.2, 0.3, 0.25, 0.15];
+        let mut f = Fir::new(taps.clone());
+        let mut input = vec![0.0; 16];
+        input[0] = 1.0;
+        let mut out = vec![0.0; 16];
+        f.process(&input, &mut out);
+
+        for k in 0..taps.len() {
+            assert!(
+                (out[k] - taps[k]).abs() < 1e-6,
+                "tap {k}: {} vs {}",
+                out[k],
+                taps[k]
+            );
+        }
+        for v in &out[taps.len()..] {
+            assert!(v.abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn asymmetric_taps_are_not_reversed_by_the_filter() {
+        // A palindrome would hide a tap-ordering bug, so use one that is not.
+        let taps = vec![1.0, 2.0, 3.0];
+        let mut f = Fir::new(taps.clone());
+        let mut input = vec![0.0; 8];
+        input[0] = 1.0;
+        let mut out = vec![0.0; 8];
+        f.process(&input, &mut out);
+        assert_eq!(&out[..3], &taps[..]);
+    }
+
+    #[test]
+    fn state_carries_across_block_boundaries() {
+        let taps = design_lowpass(31, 0.1, Window::Hamming);
+        let input: Vec<f32> = (0..256).map(|k| (k as f32 * 0.05).sin()).collect();
+
+        let mut whole = vec![0.0; 256];
+        Fir::new(taps.clone()).process(&input, &mut whole);
+
+        let mut split = vec![0.0; 256];
+        let mut f = Fir::new(taps);
+        f.process(&input[..100], &mut split[..100]);
+        f.process(&input[100..], &mut split[100..]);
+
+        for k in 0..256 {
+            assert!(
+                (whole[k] - split[k]).abs() < 1e-6,
+                "block boundary drift at {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn lowpass_passes_below_cutoff_and_rejects_above() {
+        let taps = design_lowpass(101, 0.1, Window::kaiser(8.6));
+        assert!(
+            db(response_at(&taps, 0.0)).abs() < 0.1,
+            "DC gain should be unity"
+        );
+        assert!(
+            db(response_at(&taps, 0.05)) > -1.0,
+            "passband droop too large"
+        );
+        // Kaiser with beta 8.6 gives roughly -90 dB; leave margin for the transition.
+        assert!(
+            db(response_at(&taps, 0.2)) < -60.0,
+            "stopband not deep enough"
+        );
+        assert!(db(response_at(&taps, 0.4)) < -60.0);
+    }
+
+    #[test]
+    fn lowpass_is_linear_phase() {
+        let taps = design_lowpass(51, 0.15, Window::Hamming);
+        for k in 0..51 {
+            assert!((taps[k] - taps[50 - k]).abs() < 1e-7, "asymmetry at {k}");
+        }
+    }
+
+    #[test]
+    fn halfband_zeroes_alternate_taps() {
+        let h = design_halfband(31);
+        let centre = 15;
+        for (k, v) in h.iter().enumerate() {
+            let offset = k as isize - centre as isize;
+            if offset != 0 && offset % 2 == 0 {
+                assert_eq!(*v, 0.0, "tap {k} should be exactly zero");
+            }
+        }
+        assert!(
+            (h[centre] - 0.5).abs() < 0.02,
+            "centre tap should be near 0.5"
+        );
+    }
+
+    #[test]
+    fn halfband_is_symmetric_about_quarter_rate() {
+        let h = design_halfband(31);
+        // Its defining property: the response at f and at 0.5 - f sum to unity.
+        for f in [0.05f32, 0.1, 0.15, 0.2] {
+            let sum = response_at(&h, f) + response_at(&h, 0.5 - f);
+            assert!((sum - 1.0).abs() < 0.05, "at {f}: sum {sum}");
+        }
+    }
+
+    #[test]
+    fn decimator_halves_the_rate_and_keeps_the_phase_across_blocks() {
+        let mut d = Decimator::lowpass(2, 31);
+        let input: Vec<f32> = (0..100).map(|k| k as f32).collect();
+        let mut out = vec![0.0; 64];
+
+        // 100 samples at factor two yields 50 outputs, and an odd-length block must not
+        // reset the phase or the following block would be off by one.
+        let n1 = d.process(&input[..51], &mut out);
+        let n2 = d.process(&input[51..], &mut out[n1..]);
+        assert_eq!(n1 + n2, 50, "decimated count wrong: {n1} + {n2}");
+    }
+
+    #[test]
+    fn decimator_by_one_is_a_pure_filter_that_keeps_every_sample() {
+        // The degenerate case: capture rate already equals the wanted channel rate. It must
+        // filter without dropping samples rather than panicking, so a pipeline that lands
+        // on a decimation of one needs no special-casing.
+        let mut d = Decimator::lowpass(1, 63);
+        let input: Vec<f32> = (0..256).map(|k| (k as f32 * 0.02).sin()).collect();
+        let mut out = vec![0.0; d.output_len(256)];
+        let n = d.process(&input, &mut out);
+        assert_eq!(n, 256, "a factor of one must keep every sample");
+    }
+
+    #[test]
+    fn decimator_output_matches_filter_then_discard() {
+        let taps = design_lowpass(31, 0.1, Window::Hamming);
+        let input: Vec<f32> = (0..128).map(|k| (k as f32 * 0.07).sin()).collect();
+
+        let mut filtered = vec![0.0; 128];
+        Fir::new(taps.clone()).process(&input, &mut filtered);
+
+        let mut decimated = vec![0.0; 32];
+        let n = Decimator::new(taps, 4).process(&input, &mut decimated);
+
+        assert_eq!(n, 32);
+        for k in 0..32 {
+            assert!(
+                (decimated[k] - filtered[k * 4]).abs() < 1e-5,
+                "sample {k}: {} vs {}",
+                decimated[k],
+                filtered[k * 4]
+            );
+        }
+    }
+
+    #[test]
+    fn halfband_stage_matches_the_general_decimator() {
+        let taps = design_halfband(31);
+        let input: Vec<f32> = (0..256)
+            .map(|k| (k as f32 * 0.03).sin() + 0.3 * (k as f32 * 0.31).cos())
+            .collect();
+
+        let mut want = vec![0.0; 128];
+        let n_want = Decimator::new(taps, 2).process(&input, &mut want);
+
+        let mut got = vec![0.0; 128];
+        let n_got = HalfBand::new(31).process(&input, &mut got);
+
+        assert_eq!(n_want, n_got);
+        for k in 0..n_got {
+            assert!(
+                (got[k] - want[k]).abs() < 1e-5,
+                "half-band shortcut disagrees at {k}: {} vs {}",
+                got[k],
+                want[k]
+            );
+        }
+    }
+
+    #[test]
+    fn bandpass_passes_its_band_and_rejects_either_side() {
+        let taps = design_bandpass(101, 0.1, 0.2, Window::kaiser(8.6));
+        assert!(
+            db(response_at(&taps, 0.15)) > -1.5,
+            "centre of band attenuated"
+        );
+        assert!(db(response_at(&taps, 0.02)) < -40.0, "leakage below band");
+        assert!(db(response_at(&taps, 0.35)) < -40.0, "leakage above band");
+    }
+
+    #[test]
+    fn hilbert_is_antisymmetric_with_even_taps_zeroed() {
+        let h = design_hilbert(31, Window::Hamming);
+        let centre = 15;
+        assert_eq!(h[centre], 0.0);
+        for k in 0..31 {
+            let offset = k as isize - centre as isize;
+            if offset % 2 == 0 {
+                assert_eq!(h[k], 0.0, "even offset {offset} should be zero");
+            }
+            assert!((h[k] + h[30 - k]).abs() < 1e-7, "not antisymmetric at {k}");
+        }
+    }
+
+    #[test]
+    fn hilbert_has_flat_response_across_the_middle_of_the_band() {
+        let h = design_hilbert(101, Window::kaiser(8.0));
+        for f in [0.1f32, 0.2, 0.3, 0.4] {
+            let r = response_at(&h, f);
+            assert!((r - 1.0).abs() < 0.05, "at {f}: response {r}");
+        }
+        // It cannot work at DC or Nyquist; those roll off by construction.
+        assert!(response_at(&h, 0.0) < 0.01);
+    }
+
+    #[test]
+    fn reset_clears_the_tail() {
+        let mut f = Fir::new(design_lowpass(31, 0.2, Window::Hamming));
+        let mut input = vec![0.0; 32];
+        input[0] = 100.0;
+        let mut out = vec![0.0; 32];
+        f.process(&input, &mut out);
+
+        f.reset();
+        let zeros = vec![0.0; 32];
+        f.process(&zeros, &mut out);
+        for (k, v) in out.iter().enumerate() {
+            assert!(v.abs() < 1e-9, "residual energy at {k}: {v}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "4k+3")]
+    fn halfband_rejects_a_bad_length() {
+        HalfBand::new(32);
+    }
+
+    #[test]
+    #[should_panic(expected = "cutoff must be in")]
+    fn lowpass_rejects_a_cutoff_at_nyquist() {
+        design_lowpass(31, 0.5, Window::Hamming);
+    }
+}
