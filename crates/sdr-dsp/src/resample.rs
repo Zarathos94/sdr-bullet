@@ -210,3 +210,221 @@ pub fn rational_approximation(value: f64, max_denominator: usize) -> (usize, usi
         let a = x.floor();
         let ai = a as usize;
 
+        let p_next = ai.saturating_mul(p).saturating_add(p_prev);
+        let q_next = ai.saturating_mul(q).saturating_add(q_prev);
+        if q_next > max_denominator || q_next == 0 {
+            break;
+        }
+
+        p_prev = p;
+        q_prev = q;
+        p = p_next;
+        q = q_next;
+
+        let frac = x - a;
+        if frac < 1e-12 {
+            break;
+        }
+        x = 1.0 / frac;
+    }
+
+    if p == 0 || q == 0 {
+        // The value rounds to zero at this denominator bound; fall back to nearest integer.
+        return (value.round().max(1.0) as usize, 1);
+    }
+    reduce(p, q)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::f32::consts::TAU;
+
+    fn tone(n: usize, freq: f32, rate: f32) -> Vec<f32> {
+        (0..n)
+            .map(|k| (TAU * freq * k as f32 / rate).sin())
+            .collect()
+    }
+
+    fn peak(x: &[f32]) -> f32 {
+        x.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    #[test]
+    fn gcd_reduces_ratios() {
+        assert_eq!(reduce(240_000, 48_000), (5, 1));
+        assert_eq!(reduce(48_000, 44_100), (160, 147));
+        assert_eq!(reduce(7, 3), (7, 3));
+    }
+
+    #[test]
+    fn rational_approximation_finds_exact_ratios() {
+        assert_eq!(rational_approximation(0.5, 1000), (1, 2));
+        assert_eq!(rational_approximation(2.0, 1000), (2, 1));
+        // The classic CD to DAT conversion.
+        assert_eq!(
+            rational_approximation(48_000.0 / 44_100.0, 1000),
+            (160, 147)
+        );
+    }
+
+    #[test]
+    fn rational_approximation_respects_the_denominator_bound() {
+        let (_, q) = rational_approximation(core::f64::consts::PI, 100);
+        assert!(q <= 100, "denominator {q} exceeded the bound");
+        // 355/113 is the famous approximation; with a bound of 100 we should get 22/7.
+        let (p, q) = rational_approximation(core::f64::consts::PI, 50);
+        assert_eq!((p, q), (22, 7));
+    }
+
+    #[test]
+    fn pure_decimation_produces_the_expected_count() {
+        let mut r = RationalResampler::new(1, 5, 8);
+        assert_eq!((r.interp(), r.decim()), (1, 5));
+        let input = tone(1000, 100.0, 48_000.0);
+        let mut out = vec![0.0; r.output_len(1000)];
+        let n = r.process(&input, &mut out);
+        assert!(
+            (n as i32 - 200).abs() <= 1,
+            "expected about 200 outputs, got {n}"
+        );
+    }
+
+    #[test]
+    fn pure_interpolation_produces_the_expected_count() {
+        let mut r = RationalResampler::new(4, 1, 8);
+        let input = tone(250, 100.0, 8_000.0);
+        let mut out = vec![0.0; r.output_len(250)];
+        let n = r.process(&input, &mut out);
+        assert!(
+            (n as i32 - 1000).abs() <= 1,
+            "expected about 1000 outputs, got {n}"
+        );
+    }
+
+    #[test]
+    fn output_rate_stays_exact_across_many_blocks() {
+        // The per-call count varies by one; what must hold is that the total does not drift.
+        let mut r = RationalResampler::new(160, 147, 8);
+        let block = 512;
+        let blocks = 200;
+        let input = tone(block, 440.0, 44_100.0);
+        let mut out = vec![0.0; r.output_len(block)];
+
+        let mut total = 0usize;
+        for _ in 0..blocks {
+            total += r.process(&input, &mut out);
+        }
+
+        let expected = (block * blocks) as f64 * 160.0 / 147.0;
+        let drift = (total as f64 - expected).abs();
+        assert!(
+            drift <= 2.0,
+            "output drifted by {drift} samples over {blocks} blocks"
+        );
+    }
+
+    #[test]
+    fn preserves_a_tone_well_inside_the_passband() {
+        let rate_in = 48_000.0;
+        let mut r = RationalResampler::new(1, 2, 16);
+        let input = tone(8192, 1000.0, rate_in);
+        let mut out = vec![0.0; r.output_len(8192)];
+        let n = r.process(&input, &mut out);
+
+        // Skip the filter's start-up transient before measuring.
+        let settled = &out[64..n];
+        assert!(
+            (peak(settled) - 1.0).abs() < 0.05,
+            "amplitude not preserved: peak {}",
+            peak(settled)
+        );
+    }
+
+    #[test]
+    fn interpolation_preserves_amplitude() {
+        // Without the per-branch gain scaling this comes out a factor of `interp` low.
+        let mut r = RationalResampler::new(3, 1, 16);
+        let input = tone(4096, 500.0, 48_000.0);
+        let mut out = vec![0.0; r.output_len(4096)];
+        let n = r.process(&input, &mut out);
+        let settled = &out[128..n];
+        assert!(
+            (peak(settled) - 1.0).abs() < 0.06,
+            "interpolated amplitude {} should stay near unity",
+            peak(settled)
+        );
+    }
+
+    #[test]
+    fn rejects_content_above_the_new_nyquist_limit() {
+        // 20 kHz cannot survive a drop to 16 kHz, and must be filtered rather than folded
+        // back down into the audible band.
+        let mut r = RationalResampler::new(1, 3, 16);
+        let input = tone(8192, 20_000.0, 48_000.0);
+        let mut out = vec![0.0; r.output_len(8192)];
+        let n = r.process(&input, &mut out);
+
+        let settled = &out[128..n];
+        assert!(
+            peak(settled) < 0.05,
+            "aliased energy got through: peak {}",
+            peak(settled)
+        );
+    }
+
+    #[test]
+    fn block_boundaries_do_not_disturb_the_output() {
+        let mut whole = RationalResampler::new(2, 3, 16);
+        let mut split = RationalResampler::new(2, 3, 16);
+
+        let input = tone(1024, 700.0, 48_000.0);
+        let mut out_whole = vec![0.0; whole.output_len(1024)];
+        let n_whole = whole.process(&input, &mut out_whole);
+
+        let mut out_split = vec![0.0; split.output_len(1024) * 2];
+        let n1 = split.process(&input[..300], &mut out_split);
+        let n2 = split.process(&input[300..700], &mut out_split[n1..]);
+        let n3 = split.process(&input[700..], &mut out_split[n1 + n2..]);
+
+        assert_eq!(
+            n_whole,
+            n1 + n2 + n3,
+            "total count changed when blocked differently"
+        );
+        for k in 0..n_whole {
+            assert!(
+                (out_whole[k] - out_split[k]).abs() < 1e-5,
+                "sample {k} differs across block boundaries"
+            );
+        }
+    }
+
+    #[test]
+    fn for_rates_picks_the_right_ratio() {
+        let r = RationalResampler::for_rates(240_000.0, 48_000.0, 8);
+        assert_eq!((r.interp(), r.decim()), (1, 5));
+        assert!((r.output_rate(240_000.0) - 48_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reset_clears_the_filter_tail() {
+        let mut r = RationalResampler::new(1, 2, 8);
+        let mut loud = vec![0.0f32; 64];
+        loud[0] = 100.0;
+        let mut out = vec![0.0; r.output_len(64)];
+        r.process(&loud, &mut out);
+
+        r.reset();
+        let n = r.process(&vec![0.0; 64], &mut out);
+        for k in 0..n {
+            assert!(out[k].abs() < 1e-9, "residual at {k}: {}", out[k]);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "rates must be at least 1")]
+    fn rejects_a_zero_rate() {
+        RationalResampler::new(0, 1, 8);
+    }
+}
