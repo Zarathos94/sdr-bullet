@@ -10,6 +10,7 @@
 //! and removes lane shuffles from every subsequent kernel.
 
 pub mod agc;
+pub mod demod;
 pub mod fft;
 pub mod fir;
 pub mod iq;
@@ -19,6 +20,7 @@ pub mod simd;
 pub mod window;
 
 pub use agc::{Agc, Deemphasis, Emphasis};
+pub use demod::{Mode, Pll};
 pub use fft::Fft;
 pub use fir::{Decimator, Fir, HalfBand};
 pub use iq::IqConverter;
