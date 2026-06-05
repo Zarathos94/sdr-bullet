@@ -123,3 +123,129 @@ impl Pll {
         self.lock
     }
 
+    /// Whether the loop appears locked to a tone of at least `min_amplitude`.
+    pub fn is_locked(&self, min_amplitude: f32) -> bool {
+        self.lock.abs() > min_amplitude
+    }
+
+    pub fn reset(&mut self) {
+        self.phase = 0.0;
+        self.freq = self.centre;
+        self.lock = 0.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SR: f32 = 240_000.0;
+
+    fn pilot(freq: f32, amp: f32, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|k| amp * (TAU * freq * k as f32 / SR).sin())
+            .collect()
+    }
+
+    #[test]
+    fn locks_to_a_tone_at_its_centre_frequency() {
+        let mut pll = Pll::new(SR, 19_000.0, 100.0, 20.0);
+        for s in pilot(19_000.0, 0.1, 48_000) {
+            pll.advance(s);
+        }
+        let f = pll.frequency_hz(SR);
+        assert!((f - 19_000.0).abs() < 5.0, "settled at {f} Hz");
+    }
+
+    #[test]
+    fn pulls_in_an_offset_tone_and_holds_zero_phase_error() {
+        // A second-order loop should track a frequency offset exactly, unlike a
+        // first-order loop which would sit at a constant phase error proportional to it.
+        let mut pll = Pll::new(SR, 19_000.0, 200.0, 30.0);
+        let offset = 19_050.0;
+        for s in pilot(offset, 0.1, 200_000) {
+            pll.advance(s);
+        }
+        let f = pll.frequency_hz(SR);
+        assert!((f - offset).abs() < 5.0, "tracked to {f}, wanted {offset}");
+    }
+
+    #[test]
+    fn refuses_to_pull_beyond_its_configured_range() {
+        let mut pll = Pll::new(SR, 19_000.0, 50.0, 30.0);
+        // A tone far outside the pull range must not drag the loop away with it.
+        for s in pilot(21_000.0, 0.3, 100_000) {
+            pll.advance(s);
+        }
+        let f = pll.frequency_hz(SR);
+        assert!(
+            (18_950.0..=19_050.0).contains(&f),
+            "loop escaped its clamp, sitting at {f}"
+        );
+    }
+
+    #[test]
+    fn reports_lock_only_when_a_tone_is_present() {
+        let mut locked = Pll::new(SR, 19_000.0, 100.0, 20.0);
+        for s in pilot(19_000.0, 0.2, 100_000) {
+            locked.advance(s);
+        }
+        assert!(locked.is_locked(0.01), "lock level {}", locked.lock_level());
+
+        let mut unlocked = Pll::new(SR, 19_000.0, 100.0, 20.0);
+        // Deterministic noise-like input with no 19 kHz component.
+        let mut state = 0x1234_5678u32;
+        for _ in 0..100_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let n = (state as f32 / u32::MAX as f32) * 0.4 - 0.2;
+            unlocked.advance(n);
+        }
+        assert!(
+            !unlocked.is_locked(0.01),
+            "reported lock on noise, level {}",
+            unlocked.lock_level()
+        );
+    }
+
+    #[test]
+    fn recovered_phase_aligns_with_the_input_tone() {
+        let mut pll = Pll::new(SR, 19_000.0, 100.0, 20.0);
+        let samples = pilot(19_000.0, 0.1, 200_000);
+        for s in &samples[..150_000] {
+            pll.advance(*s);
+        }
+
+        // Once locked, the loop's sine should correlate strongly with the input and its
+        // cosine should not — that is what having zero phase error means, and it is the
+        // convention the stereo decoder depends on when it doubles this phase.
+        let (mut corr_sin, mut corr_cos) = (0.0f64, 0.0f64);
+        for s in &samples[150_000..] {
+            let ph = pll.advance(*s);
+            corr_sin += (*s * ph.sin()) as f64;
+            corr_cos += (*s * ph.cos()) as f64;
+        }
+        assert!(
+            corr_sin.abs() > corr_cos.abs() * 8.0,
+            "phase misaligned: sin correlation {corr_sin}, cos {corr_cos}"
+        );
+    }
+
+    #[test]
+    fn reset_returns_the_loop_to_its_rest_frequency() {
+        let mut pll = Pll::new(SR, 19_000.0, 200.0, 30.0);
+        for s in pilot(19_100.0, 0.2, 50_000) {
+            pll.advance(s);
+        }
+        pll.reset();
+        assert!((pll.frequency_hz(SR) - 19_000.0).abs() < 0.1);
+        assert_eq!(pll.lock_level(), 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "below Nyquist")]
+    fn rejects_a_centre_frequency_above_nyquist() {
+        Pll::new(48_000.0, 30_000.0, 100.0, 20.0);
+    }
+}
