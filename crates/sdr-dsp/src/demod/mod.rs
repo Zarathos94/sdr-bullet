@@ -4,8 +4,10 @@
 //! audio at the same rate. Rate conversion to the output device happens afterwards, in
 //! [`crate::resample`], so the demodulators never have to know what the sound card wants.
 
+pub mod fm;
 pub mod pll;
 
+pub use fm::{FmDemod, StereoDecoder};
 pub use pll::Pll;
 
 /// Modes the receiver can be switched between.
