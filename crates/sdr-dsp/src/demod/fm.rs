@@ -204,3 +204,211 @@ fn highpass_from_lowpass(lowpass: &[f32]) -> Vec<f32> {
     h
 }
 
+/// Separates a broadcast FM multiplex into left and right channels.
+///
+/// The multiplex carries the sum channel at baseband, the difference channel on a
+/// suppressed-carrier subcarrier at 38 kHz, and a 19 kHz pilot. Because the subcarrier is
+/// suppressed, its phase can only come from doubling the pilot — which is why this holds a
+/// [`Pll`] rather than a free-running oscillator. A few degrees of phase error here shows
+/// up directly as one channel leaking into the other.
+#[derive(Debug)]
+pub struct StereoDecoder {
+    pilot_filter: Fir,
+    sum_filter: Fir,
+    difference_filter: Fir,
+    pll: Pll,
+    pilot: Vec<f32>,
+    /// Phase the loop recovered for each sample of the last block.
+    ///
+    /// Kept because the data subcarrier sits at three times this phase, and being
+    /// suppressed-carrier it has no other reference. Handing the phase out rather than
+    /// having the data decoder run its own loop means the two cannot disagree.
+    phase: Vec<f32>,
+    difference: Vec<f32>,
+    difference_filtered: Vec<f32>,
+    sum: Vec<f32>,
+    /// Pilot amplitude above which stereo is considered present.
+    lock_threshold: f32,
+    forced_mono: bool,
+}
+
+impl StereoDecoder {
+    /// # Panics
+    /// If the sample rate cannot carry the 38 kHz subcarrier.
+    pub fn new(sample_rate: f32) -> Self {
+        assert!(
+            sample_rate > 90_000.0,
+            "stereo needs headroom above the 38 kHz subcarrier, got {sample_rate}"
+        );
+
+        let norm = |hz: f32| hz / sample_rate;
+        Self {
+            // Narrow enough to reject the programme either side of the pilot.
+            pilot_filter: Fir::new(design_bandpass(
+                127,
+                norm(18_500.0),
+                norm(19_500.0),
+                Window::kaiser(8.6),
+            )),
+            sum_filter: Fir::new(design_lowpass(127, norm(15_000.0), Window::kaiser(8.6))),
+            difference_filter: Fir::new(design_lowpass(127, norm(15_000.0), Window::kaiser(8.6))),
+            pll: Pll::new(sample_rate, 19_000.0, 100.0, 20.0),
+            pilot: Vec::new(),
+            phase: Vec::new(),
+            difference: Vec::new(),
+            difference_filtered: Vec::new(),
+            sum: Vec::new(),
+            lock_threshold: 0.003,
+            forced_mono: false,
+        }
+    }
+
+    /// Forces mono output even when a pilot is present.
+    pub fn set_forced_mono(&mut self, mono: bool) {
+        self.forced_mono = mono;
+    }
+
+    /// Pilot amplitude above which the decoder switches to stereo.
+    ///
+    /// # Panics
+    /// If `threshold` is not positive.
+    pub fn set_lock_threshold(&mut self, threshold: f32) {
+        assert!(threshold > 0.0, "threshold must be positive");
+        self.lock_threshold = threshold;
+    }
+
+    pub fn pilot_level(&self) -> f32 {
+        self.pll.lock_level().abs()
+    }
+
+    /// Pilot phase recovered for each sample of the last block processed.
+    ///
+    /// The data subcarrier at 57 kHz is three times this. Feed it to
+    /// [`super::RdsDecoder::process`] alongside the same multiplex.
+    pub fn pilot_phase(&self) -> &[f32] {
+        &self.phase
+    }
+
+    /// Whether the pilot loop has acquired, which is the precondition for both stereo and
+    /// data decoding.
+    pub fn is_locked(&self) -> bool {
+        self.pll.is_locked(self.lock_threshold)
+    }
+
+    pub fn reset(&mut self) {
+        self.pilot_filter.reset();
+        self.sum_filter.reset();
+        self.difference_filter.reset();
+        self.pll.reset();
+    }
+
+    /// Decodes `mpx` into `left` and `right`. Returns true if stereo was recovered.
+    ///
+    /// With no pilot, or with stereo forced off, both outputs receive the sum channel and
+    /// the result is mono.
+    ///
+    /// # Panics
+    /// If either output is shorter than the input.
+    pub fn process(&mut self, mpx: &[f32], left: &mut [f32], right: &mut [f32]) -> bool {
+        let n = mpx.len();
+        assert!(
+            left.len() >= n && right.len() >= n,
+            "output buffers too short"
+        );
+
+        self.pilot.resize(n, 0.0);
+        self.phase.resize(n, 0.0);
+        self.difference.resize(n, 0.0);
+        self.difference_filtered.resize(n, 0.0);
+        self.sum.resize(n, 0.0);
+
+        self.pilot_filter.process(mpx, &mut self.pilot);
+
+        // Track the pilot and, at each sample, mix the multiplex down by twice the
+        // recovered phase. Doubling the phase is what turns the 19 kHz reference into a
+        // coherent 38 kHz carrier.
+        for k in 0..n {
+            let phase = self.pll.advance(self.pilot[k]);
+            self.phase[k] = phase;
+            // The factor of two restores the level that double-sideband mixing halves.
+            self.difference[k] = mpx[k] * (2.0 * phase).cos() * 2.0;
+        }
+
+        self.sum_filter.process(mpx, &mut self.sum);
+        self.difference_filter
+            .process(&self.difference, &mut self.difference_filtered);
+
+        let stereo = !self.forced_mono && self.pll.is_locked(self.lock_threshold);
+
+        if stereo {
+            for k in 0..n {
+                // sum is L+R and difference is L-R, so halving their sum and difference
+                // recovers the individual channels.
+                left[k] = (self.sum[k] + self.difference_filtered[k]) * 0.5;
+                right[k] = (self.sum[k] - self.difference_filtered[k]) * 0.5;
+            }
+        } else {
+            left[..n].copy_from_slice(&self.sum[..n]);
+            right[..n].copy_from_slice(&self.sum[..n]);
+        }
+
+        stereo
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::f32::consts::TAU;
+
+    const WFM_RATE: f32 = 240_000.0;
+    const NFM_RATE: f32 = 48_000.0;
+
+    /// Builds complex baseband frequency-modulated by `message`.
+    fn modulate(message: &[f32], deviation: f32, rate: f32) -> (Vec<f32>, Vec<f32>) {
+        let mut phase = 0.0f32;
+        let mut i = Vec::with_capacity(message.len());
+        let mut q = Vec::with_capacity(message.len());
+        for m in message {
+            phase += TAU * deviation * m / rate;
+            i.push(phase.cos());
+            q.push(phase.sin());
+        }
+        (i, q)
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    /// Correlation of a block against a tone, used to measure how much of that tone it holds.
+    fn tone_amplitude(x: &[f32], freq: f32, rate: f32) -> f32 {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (k, v) in x.iter().enumerate() {
+            let ang = TAU * freq * k as f32 / rate;
+            re += (*v * ang.cos()) as f64;
+            im += (*v * ang.sin()) as f64;
+        }
+        2.0 * ((re * re + im * im).sqrt() / x.len() as f64) as f32
+    }
+
+    #[test]
+    fn recovers_a_tone_from_a_modulated_carrier() {
+        let n = 24_000;
+        let message: Vec<f32> = (0..n)
+            .map(|k| (TAU * 1000.0 * k as f32 / NFM_RATE).sin())
+            .collect();
+        let (i, q) = modulate(&message, 5_000.0, NFM_RATE);
+
+        let mut demod = FmDemod::new(NFM_RATE, 5_000.0);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+
+        // Skip the first sample, where the discriminator has no previous sample to use.
+        let amp = tone_amplitude(&out[16..], 1000.0, NFM_RATE);
+        assert!(
+            (amp - 1.0).abs() < 0.05,
+            "recovered amplitude {amp}, expected 1.0"
+        );
+    }
+
