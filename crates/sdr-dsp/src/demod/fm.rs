@@ -412,3 +412,214 @@ mod tests {
         );
     }
 
+    #[test]
+    fn output_scales_with_deviation() {
+        let n = 12_000;
+        let message: Vec<f32> = (0..n)
+            .map(|k| (TAU * 800.0 * k as f32 / NFM_RATE).sin())
+            .collect();
+
+        // Modulate at half the deviation the demodulator expects; output should halve.
+        let (i, q) = modulate(&message, 2_500.0, NFM_RATE);
+        let mut demod = FmDemod::new(NFM_RATE, 5_000.0);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+
+        let amp = tone_amplitude(&out[16..], 800.0, NFM_RATE);
+        assert!(
+            (amp - 0.5).abs() < 0.05,
+            "expected half-scale output, got {amp}"
+        );
+    }
+
+    #[test]
+    fn an_unmodulated_carrier_demodulates_to_silence() {
+        let n = 4096;
+        let (i, q) = modulate(&vec![0.0; n], 5_000.0, NFM_RATE);
+        let mut demod = FmDemod::new(NFM_RATE, 5_000.0);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+        assert!(
+            rms(&out[16..]) < 1e-4,
+            "carrier produced output: {}",
+            rms(&out[16..])
+        );
+    }
+
+    #[test]
+    fn state_carries_across_blocks() {
+        let n = 4800;
+        let message: Vec<f32> = (0..n)
+            .map(|k| (TAU * 500.0 * k as f32 / NFM_RATE).sin())
+            .collect();
+        let (i, q) = modulate(&message, 5_000.0, NFM_RATE);
+
+        let mut whole = vec![0.0; n];
+        FmDemod::new(NFM_RATE, 5_000.0).process(&i, &q, &mut whole);
+
+        let mut split = vec![0.0; n];
+        let mut d = FmDemod::new(NFM_RATE, 5_000.0);
+        d.process(&i[..1000], &q[..1000], &mut split[..1000]);
+        d.process(&i[1000..], &q[1000..], &mut split[1000..]);
+
+        for k in 0..n {
+            assert!((whole[k] - split[k]).abs() < 1e-5, "discontinuity at {k}");
+        }
+    }
+
+    #[test]
+    fn spectral_inversion_produces_a_complementary_highpass() {
+        use crate::fir::response_at;
+        let lp = design_lowpass(31, 0.1, Window::Hamming);
+        let hp = highpass_from_lowpass(&lp);
+        // The two responses should sum to unity at every frequency.
+        for f in [0.0f32, 0.05, 0.1, 0.2, 0.4] {
+            let sum = response_at(&lp, f) + response_at(&hp, f);
+            assert!((sum - 1.0).abs() < 0.06, "at {f}: {sum}");
+        }
+        assert!(response_at(&hp, 0.0) < 0.01, "high-pass should block DC");
+        assert!(
+            response_at(&hp, 0.4) > 0.9,
+            "high-pass should pass the top of the band"
+        );
+    }
+
+    #[test]
+    fn squelch_opens_on_signal_and_closes_on_noise() {
+        let n = 48_000;
+
+        let message: Vec<f32> = (0..n)
+            .map(|k| (TAU * 1000.0 * k as f32 / NFM_RATE).sin())
+            .collect();
+        let (i, q) = modulate(&message, 5_000.0, NFM_RATE);
+        let mut demod = FmDemod::new(NFM_RATE, 5_000.0);
+        demod.squelch_mut().set_enabled(true);
+        let mut out = vec![0.0; n];
+        let open = demod.process(&i, &q, &mut out);
+        assert!(open, "squelch stayed shut on a clean signal");
+        assert!(rms(&out[8000..]) > 0.1, "audio was gated away");
+
+        // Random phase is what an empty channel looks like after the discriminator.
+        let mut state = 0xBEEF_1234u32;
+        let mut ni = Vec::with_capacity(n);
+        let mut nq = Vec::with_capacity(n);
+        for _ in 0..n {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let ph = (state as f32 / u32::MAX as f32) * TAU;
+            ni.push(ph.cos());
+            nq.push(ph.sin());
+        }
+        let mut noisy = FmDemod::new(NFM_RATE, 5_000.0);
+        noisy.squelch_mut().set_enabled(true);
+        let mut nout = vec![0.0; n];
+        let open = noisy.process(&ni, &nq, &mut nout);
+        assert!(!open, "squelch stayed open on noise");
+        assert!(
+            rms(&nout[24_000..]) < 0.05,
+            "noise leaked through a closed squelch"
+        );
+    }
+
+    #[test]
+    fn disabled_squelch_never_gates() {
+        let n = 8192;
+        let mut demod = FmDemod::new(NFM_RATE, 5_000.0);
+        demod.squelch_mut().set_enabled(false);
+        let (i, q) = modulate(&vec![0.0; n], 5_000.0, NFM_RATE);
+        let mut out = vec![0.0; n];
+        assert!(demod.process(&i, &q, &mut out));
+    }
+
+    /// Builds a stereo multiplex from separate left and right channels.
+    fn build_mpx(left: &[f32], right: &[f32], pilot_amp: f32, rate: f32) -> Vec<f32> {
+        (0..left.len())
+            .map(|k| {
+                let t = k as f32 / rate;
+                let sum = left[k] + right[k];
+                let diff = left[k] - right[k];
+                sum + diff * (TAU * 38_000.0 * t).cos() + pilot_amp * (TAU * 19_000.0 * t).sin()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn separates_a_signal_present_on_only_one_channel() {
+        let n = 240_000;
+        let left: Vec<f32> = (0..n)
+            .map(|k| 0.5 * (TAU * 1000.0 * k as f32 / WFM_RATE).sin())
+            .collect();
+        let right = vec![0.0f32; n];
+        let mpx = build_mpx(&left, &right, 0.1, WFM_RATE);
+
+        let mut dec = StereoDecoder::new(WFM_RATE);
+        let mut l = vec![0.0; n];
+        let mut r = vec![0.0; n];
+        let stereo = dec.process(&mpx, &mut l, &mut r);
+        assert!(stereo, "pilot present but stereo not detected");
+
+        // Measure once the pilot loop has settled.
+        let tail = 180_000;
+        let l_amp = tone_amplitude(&l[tail..], 1000.0, WFM_RATE);
+        let r_amp = tone_amplitude(&r[tail..], 1000.0, WFM_RATE);
+
+        assert!(
+            (l_amp - 0.5).abs() < 0.08,
+            "left amplitude {l_amp}, expected 0.5"
+        );
+        let separation_db = 20.0 * (l_amp / r_amp.max(1e-9)).log10();
+        assert!(
+            separation_db > 20.0,
+            "only {separation_db:.1} dB of channel separation"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_mono_without_a_pilot() {
+        let n = 120_000;
+        let left: Vec<f32> = (0..n)
+            .map(|k| 0.4 * (TAU * 700.0 * k as f32 / WFM_RATE).sin())
+            .collect();
+        let right: Vec<f32> = (0..n)
+            .map(|k| 0.4 * (TAU * 700.0 * k as f32 / WFM_RATE).sin())
+            .collect();
+        // Zero pilot amplitude: a mono broadcast.
+        let mpx = build_mpx(&left, &right, 0.0, WFM_RATE);
+
+        let mut dec = StereoDecoder::new(WFM_RATE);
+        let mut l = vec![0.0; n];
+        let mut r = vec![0.0; n];
+        let stereo = dec.process(&mpx, &mut l, &mut r);
+
+        assert!(!stereo, "claimed stereo with no pilot present");
+        for k in 100_000..n {
+            assert!((l[k] - r[k]).abs() < 1e-6, "mono channels differ at {k}");
+        }
+    }
+
+    #[test]
+    fn forced_mono_overrides_a_present_pilot() {
+        let n = 120_000;
+        let left: Vec<f32> = (0..n)
+            .map(|k| 0.5 * (TAU * 1000.0 * k as f32 / WFM_RATE).sin())
+            .collect();
+        let right = vec![0.0f32; n];
+        let mpx = build_mpx(&left, &right, 0.1, WFM_RATE);
+
+        let mut dec = StereoDecoder::new(WFM_RATE);
+        dec.set_forced_mono(true);
+        let mut l = vec![0.0; n];
+        let mut r = vec![0.0; n];
+        assert!(!dec.process(&mpx, &mut l, &mut r));
+        for k in 100_000..n {
+            assert_eq!(l[k], r[k], "forced mono still produced a difference at {k}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "headroom above the 38 kHz subcarrier")]
+    fn stereo_rejects_a_rate_that_cannot_carry_the_subcarrier() {
+        StereoDecoder::new(48_000.0);
+    }
+}
