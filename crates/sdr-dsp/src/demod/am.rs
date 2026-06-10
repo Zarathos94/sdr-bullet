@@ -118,3 +118,126 @@ mod tests {
         let mut out = vec![0.0; n];
         demod.process(&i, &q, &mut out);
 
+        let amp = tone_amplitude(&out[4800..], 1000.0);
+        assert!(
+            (amp - 0.5).abs() < 0.03,
+            "recovered {amp}, expected 0.5 modulation depth"
+        );
+    }
+
+    #[test]
+    fn removes_the_carrier_offset() {
+        let n = 48_000;
+        let message: Vec<f32> = (0..n)
+            .map(|k| (TAU * 1000.0 * k as f32 / SR).sin())
+            .collect();
+        let (i, q) = modulate(&message, 0.3);
+
+        let mut demod = AmDemod::new(SR);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+
+        let tail = &out[24_000..];
+        let mean = tail.iter().sum::<f32>() / tail.len() as f32;
+        assert!(
+            mean.abs() < 0.01,
+            "residual carrier of {mean} left in the output"
+        );
+        assert!(
+            (demod.carrier_level() - 1.0).abs() < 0.05,
+            "carrier tracked to {}",
+            demod.carrier_level()
+        );
+    }
+
+    #[test]
+    fn depth_scales_the_output() {
+        let n = 24_000;
+        let message: Vec<f32> = (0..n)
+            .map(|k| (TAU * 900.0 * k as f32 / SR).sin())
+            .collect();
+
+        let measure = |depth: f32| {
+            let (i, q) = modulate(&message, depth);
+            let mut demod = AmDemod::new(SR);
+            let mut out = vec![0.0; n];
+            demod.process(&i, &q, &mut out);
+            tone_amplitude(&out[4800..], 900.0)
+        };
+
+        let quarter = measure(0.25);
+        let half = measure(0.5);
+        assert!(
+            (half / quarter - 2.0).abs() < 0.1,
+            "expected a 2:1 ratio, got {}",
+            half / quarter
+        );
+    }
+
+    #[test]
+    fn an_unmodulated_carrier_produces_silence() {
+        let n = 24_000;
+        let (i, q) = modulate(&vec![0.0; n], 0.5);
+        let mut demod = AmDemod::new(SR);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+        let tail = &out[4800..];
+        let rms = (tail.iter().map(|v| v * v).sum::<f32>() / tail.len() as f32).sqrt();
+        assert!(rms < 1e-4, "steady carrier produced {rms} of output");
+    }
+
+    #[test]
+    fn is_insensitive_to_carrier_phase() {
+        // Envelope detection should not care where the carrier sits in phase, which is
+        // the whole reason to use it over a coherent detector.
+        let n = 24_000;
+        let message: Vec<f32> = (0..n)
+            .map(|k| (TAU * 1000.0 * k as f32 / SR).sin())
+            .collect();
+
+        let amp_at = |phase: f32| {
+            let i: Vec<f32> = message
+                .iter()
+                .map(|m| (1.0 + 0.5 * m) * phase.cos())
+                .collect();
+            let q: Vec<f32> = message
+                .iter()
+                .map(|m| (1.0 + 0.5 * m) * phase.sin())
+                .collect();
+            let mut demod = AmDemod::new(SR);
+            let mut out = vec![0.0; n];
+            demod.process(&i, &q, &mut out);
+            tone_amplitude(&out[4800..], 1000.0)
+        };
+
+        let a = amp_at(0.0);
+        let b = amp_at(1.0);
+        assert!((a - b).abs() < 0.01, "phase changed the result: {a} vs {b}");
+    }
+
+    #[test]
+    fn vector_and_scalar_tails_agree() {
+        for n in [1usize, 3, 5, 7, 9, 33] {
+            let i: Vec<f32> = (0..n).map(|k| 1.0 + 0.1 * k as f32).collect();
+            let q: Vec<f32> = (0..n).map(|k| 0.05 * k as f32).collect();
+            let mut demod = AmDemod::new(SR);
+            let mut out = vec![0.0; n];
+            demod.process(&i, &q, &mut out);
+            for v in &out {
+                assert!(v.is_finite(), "non-finite output at n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn reset_clears_the_carrier_estimate() {
+        let mut demod = AmDemod::new(SR);
+        let i = vec![5.0f32; 1000];
+        let q = vec![0.0f32; 1000];
+        let mut out = vec![0.0; 1000];
+        demod.process(&i, &q, &mut out);
+        assert!(demod.carrier_level() > 0.0);
+        demod.reset();
+        assert_eq!(demod.carrier_level(), 0.0);
+    }
+}
