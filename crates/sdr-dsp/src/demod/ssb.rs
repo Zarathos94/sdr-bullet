@@ -166,3 +166,171 @@ mod tests {
         (i, q)
     }
 
+    fn tone_amplitude(x: &[f32], freq: f32) -> f32 {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (k, v) in x.iter().enumerate() {
+            let ang = TAU * freq * k as f32 / SR;
+            re += (*v * ang.cos()) as f64;
+            im += (*v * ang.sin()) as f64;
+        }
+        2.0 * ((re * re + im * im).sqrt() / x.len() as f64) as f32
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn upper_sideband_recovers_a_positive_frequency_tone() {
+        let n = 48_000;
+        let (i, q) = exponential(1000.0, n);
+        let mut demod = SsbDemod::new(SR, Sideband::Upper, 2700.0);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+
+        let amp = tone_amplitude(&out[2000..], 1000.0);
+        assert!(
+            (amp - 1.0).abs() < 0.1,
+            "recovered amplitude {amp}, expected 1.0"
+        );
+    }
+
+    #[test]
+    fn upper_sideband_rejects_a_negative_frequency_tone() {
+        let n = 48_000;
+        let (i, q) = exponential(-1000.0, n);
+        let mut demod = SsbDemod::new(SR, Sideband::Upper, 2700.0);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+
+        let residual = rms(&out[2000..]);
+        assert!(
+            residual < 0.02,
+            "opposite sideband leaked through at {residual}"
+        );
+    }
+
+    #[test]
+    fn lower_sideband_recovers_a_negative_frequency_tone() {
+        let n = 48_000;
+        let (i, q) = exponential(-1000.0, n);
+        let mut demod = SsbDemod::new(SR, Sideband::Lower, 2700.0);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+
+        let amp = tone_amplitude(&out[2000..], 1000.0);
+        assert!(
+            (amp - 1.0).abs() < 0.1,
+            "recovered amplitude {amp}, expected 1.0"
+        );
+    }
+
+    #[test]
+    fn lower_sideband_rejects_a_positive_frequency_tone() {
+        let n = 48_000;
+        let (i, q) = exponential(1000.0, n);
+        let mut demod = SsbDemod::new(SR, Sideband::Lower, 2700.0);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+
+        let residual = rms(&out[2000..]);
+        assert!(
+            residual < 0.02,
+            "opposite sideband leaked through at {residual}"
+        );
+    }
+
+    #[test]
+    fn sideband_rejection_is_at_least_forty_decibels() {
+        let n = 48_000;
+        let measure = |sb: Sideband, freq: f32| {
+            let (i, q) = exponential(freq, n);
+            let mut demod = SsbDemod::new(SR, sb, 2700.0);
+            let mut out = vec![0.0; n];
+            demod.process(&i, &q, &mut out);
+            rms(&out[4000..])
+        };
+
+        let wanted = measure(Sideband::Upper, 1200.0);
+        let unwanted = measure(Sideband::Upper, -1200.0);
+        let rejection = 20.0 * (wanted / unwanted.max(1e-12)).log10();
+        assert!(
+            rejection > 40.0,
+            "only {rejection:.1} dB of sideband rejection"
+        );
+    }
+
+    #[test]
+    fn rejects_content_beyond_the_passband() {
+        // 5 kHz is well outside a 2.7 kHz voice filter and must not appear in the audio.
+        let n = 48_000;
+        let (i, q) = exponential(5000.0, n);
+        let mut demod = SsbDemod::new(SR, Sideband::Upper, 2700.0);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+        assert!(rms(&out[4000..]) < 0.02, "out-of-band signal got through");
+    }
+
+    #[test]
+    fn passes_multiple_tones_within_the_band() {
+        let n = 48_000;
+        let mut i = vec![0.0f32; n];
+        let mut q = vec![0.0f32; n];
+        for freq in [500.0f32, 1200.0, 2000.0] {
+            for k in 0..n {
+                i[k] += (TAU * freq * k as f32 / SR).cos() / 3.0;
+                q[k] += (TAU * freq * k as f32 / SR).sin() / 3.0;
+            }
+        }
+
+        let mut demod = SsbDemod::new(SR, Sideband::Upper, 2700.0);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+
+        for freq in [500.0f32, 1200.0, 2000.0] {
+            let amp = tone_amplitude(&out[4000..], freq);
+            assert!(
+                (amp - 1.0 / 3.0).abs() < 0.06,
+                "tone at {freq} came out at {amp}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_bandwidth_works_for_cw() {
+        // A carrier tuned 700 Hz off produces a 700 Hz beat note through a 500 Hz filter
+        // centred at the same offset.
+        let n = 48_000;
+        let (i, q) = exponential(700.0, n);
+        let mut demod = SsbDemod::new(SR, Sideband::Upper, 1400.0);
+        let mut out = vec![0.0; n];
+        demod.process(&i, &q, &mut out);
+
+        let amp = tone_amplitude(&out[4000..], 700.0);
+        assert!(amp > 0.8, "CW beat note came out at {amp}");
+    }
+
+    #[test]
+    fn state_carries_across_blocks() {
+        let n = 24_000;
+        let (i, q) = exponential(1000.0, n);
+
+        let mut whole = vec![0.0; n];
+        SsbDemod::new(SR, Sideband::Upper, 2700.0).process(&i, &q, &mut whole);
+
+        let mut split = vec![0.0; n];
+        let mut d = SsbDemod::new(SR, Sideband::Upper, 2700.0);
+        d.process(&i[..5000], &q[..5000], &mut split[..5000]);
+        d.process(&i[5000..], &q[5000..], &mut split[5000..]);
+
+        for k in 0..n {
+            assert!((whole[k] - split[k]).abs() < 1e-4, "discontinuity at {k}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "bandwidth must fit below Nyquist")]
+    fn rejects_a_bandwidth_beyond_nyquist() {
+        SsbDemod::new(48_000.0, Sideband::Upper, 50_000.0);
+    }
+}
