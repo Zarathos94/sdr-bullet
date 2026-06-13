@@ -7,11 +7,13 @@
 pub mod am;
 pub mod fm;
 pub mod pll;
+pub mod rds;
 pub mod ssb;
 
 pub use am::AmDemod;
 pub use fm::{FmDemod, StereoDecoder};
 pub use pll::Pll;
+pub use rds::{RdsDecoder, RdsState};
 pub use ssb::{Sideband, SsbDemod};
 
 /// Modes the receiver can be switched between.
