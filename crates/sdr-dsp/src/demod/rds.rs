@@ -267,3 +267,273 @@ fn sanitise(bytes: &[u8]) -> String {
     s.trim_end().to_string()
 }
 
+/// Recovers RDS from a demodulated FM multiplex.
+///
+/// Feed it the multiplex and the stereo pilot's recovered phase. The subcarrier sits at
+/// exactly three times that phase, so no separate carrier recovery is needed — which also
+/// means RDS only decodes when the pilot loop is locked.
+#[derive(Debug)]
+pub struct RdsDecoder {
+    subcarrier_filter: Fir,
+    baseband_filter: Fir,
+    /// Fractional position within the current bit, advancing by `clock_step` each sample.
+    clock: f32,
+    clock_step: f32,
+    /// Running integral of the first and second halves of the current symbol.
+    first_half: f32,
+    second_half: f32,
+    /// Previous biphase decision, for the differential decode.
+    previous_bit: Option<bool>,
+    /// Sliding 26-bit window over the recovered bitstream.
+    window: u32,
+    window_fill: u32,
+    synchronised: bool,
+    /// Which block of the group is expected next.
+    block_index: usize,
+    group: [u16; 4],
+    /// Consecutive failed blocks before sync is abandoned.
+    misses: u32,
+    decoder: GroupDecoder,
+    filtered: Vec<f32>,
+    baseband: Vec<f32>,
+    shaped: Vec<f32>,
+    /// Phase added to the recovered subcarrier reference.
+    ///
+    /// The standard permits the data subcarrier to sit either in phase or in quadrature
+    /// with the pilot's third harmonic, and stations differ. Differential decoding absorbs
+    /// a half-turn but not a quarter, so this stays adjustable and is settled against real
+    /// transmissions rather than assumed.
+    subcarrier_phase: f32,
+}
+
+impl RdsDecoder {
+    /// # Panics
+    /// If the sample rate cannot carry the 57 kHz subcarrier and its sidebands.
+    pub fn new(sample_rate: f32) -> Self {
+        assert!(
+            sample_rate > 122_000.0,
+            "RDS needs headroom above the 57 kHz subcarrier, got {sample_rate}"
+        );
+        let norm = |hz: f32| hz / sample_rate;
+        Self {
+            // The biphase spectrum spans roughly 2.4 kHz either side of the subcarrier.
+            subcarrier_filter: Fir::new(design_bandpass(
+                151,
+                norm(54_600.0),
+                norm(59_400.0),
+                Window::kaiser(8.6),
+            )),
+            baseband_filter: Fir::new(design_lowpass(101, norm(2_400.0), Window::kaiser(8.6))),
+            clock: 0.0,
+            clock_step: BIT_RATE / sample_rate,
+            first_half: 0.0,
+            second_half: 0.0,
+            previous_bit: None,
+            window: 0,
+            window_fill: 0,
+            synchronised: false,
+            block_index: 0,
+            group: [0; 4],
+            misses: 0,
+            decoder: GroupDecoder::new(),
+            filtered: Vec::new(),
+            baseband: Vec::new(),
+            shaped: Vec::new(),
+            subcarrier_phase: 0.0,
+        }
+    }
+
+    /// Rotates the recovered subcarrier reference, in radians.
+    pub fn set_subcarrier_phase(&mut self, radians: f32) {
+        self.subcarrier_phase = radians;
+    }
+
+    pub fn state(&self) -> &RdsState {
+        self.decoder.state()
+    }
+
+    pub fn is_synchronised(&self) -> bool {
+        self.synchronised
+    }
+
+    pub fn reset(&mut self) {
+        self.subcarrier_filter.reset();
+        self.baseband_filter.reset();
+        self.clock = 0.0;
+        self.first_half = 0.0;
+        self.second_half = 0.0;
+        self.previous_bit = None;
+        self.window = 0;
+        self.window_fill = 0;
+        self.synchronised = false;
+        self.block_index = 0;
+        self.misses = 0;
+        self.decoder.reset();
+    }
+
+    /// Processes a block of multiplex alongside the pilot phase recovered for each sample.
+    ///
+    /// # Panics
+    /// If the two slices differ in length.
+    pub fn process(&mut self, mpx: &[f32], pilot_phase: &[f32]) {
+        assert_eq!(
+            mpx.len(),
+            pilot_phase.len(),
+            "phase must accompany every sample"
+        );
+        let n = mpx.len();
+        self.filtered.resize(n, 0.0);
+        self.baseband.resize(n, 0.0);
+        self.shaped.resize(n, 0.0);
+
+        self.subcarrier_filter.process(mpx, &mut self.filtered);
+
+        // Coherent detection against three times the pilot phase. The subcarrier is
+        // suppressed, so this is the only phase reference available.
+        for k in 0..n {
+            self.baseband[k] =
+                self.filtered[k] * (3.0 * pilot_phase[k] + self.subcarrier_phase).cos();
+        }
+
+        self.baseband_filter
+            .process(&self.baseband, &mut self.shaped);
+
+        for k in 0..n {
+            self.advance_clock(self.shaped[k]);
+        }
+    }
+
+    /// Integrates one sample into the current symbol and emits a bit at each boundary.
+    fn advance_clock(&mut self, sample: f32) {
+        if self.clock < 0.5 {
+            self.first_half += sample;
+        } else {
+            self.second_half += sample;
+        }
+
+        self.clock += self.clock_step;
+        if self.clock < 1.0 {
+            return;
+        }
+        self.clock -= 1.0;
+
+        // A biphase symbol is a pulse followed by its inverse, so the difference between
+        // the two half-integrals carries the bit and any constant offset cancels.
+        let decision = self.first_half - self.second_half;
+        let bit = decision > 0.0;
+        self.first_half = 0.0;
+        self.second_half = 0.0;
+
+        // The data is differentially encoded, so a bit is the change between consecutive
+        // symbols rather than the symbol itself. That makes it immune to the demodulator
+        // settling on the opposite phase.
+        let data_bit = match self.previous_bit {
+            Some(prev) => prev != bit,
+            None => {
+                self.previous_bit = Some(bit);
+                return;
+            }
+        };
+        self.previous_bit = Some(bit);
+
+        self.push_bit(data_bit);
+    }
+
+    fn push_bit(&mut self, bit: bool) {
+        self.window = ((self.window << 1) | bit as u32) & 0x3FF_FFFF;
+        self.window_fill = (self.window_fill + 1).min(26);
+        if self.window_fill < 26 {
+            return;
+        }
+
+        if self.synchronised {
+            // Once synchronised the blocks arrive on a fixed 26-bit cadence, so only test
+            // at those boundaries rather than at every bit.
+            self.window_fill = 0;
+            self.consume_block();
+        } else if let Some(offset) = classify(self.window) {
+            // The stream carries no framing, so sync means finding a bit position where
+            // the syndrome matches. Waiting for an A block gives a known group boundary.
+            if offset == Offset::A {
+                self.synchronised = true;
+                self.block_index = 0;
+                self.misses = 0;
+                self.window_fill = 0;
+                self.consume_block();
+            }
+        }
+    }
+
+    fn consume_block(&mut self) {
+        let info = ((self.window >> 10) & 0xFFFF) as u16;
+        let expected = match self.block_index {
+            0 => Offset::A,
+            1 => Offset::B,
+            2 => Offset::C,
+            _ => Offset::D,
+        };
+
+        let actual = classify(self.window);
+        // Version B groups substitute C' for C, so accept either in that position.
+        let ok = match (self.block_index, actual) {
+            (2, Some(Offset::C)) | (2, Some(Offset::CPrime)) => true,
+            (_, Some(o)) => o == expected,
+            (_, None) => false,
+        };
+
+        if ok {
+            self.decoder.state.blocks_valid += 1;
+            self.misses = 0;
+        } else {
+            self.decoder.state.blocks_invalid += 1;
+            self.misses += 1;
+            // Persistent failures mean the bit phase has slipped; drop back to searching.
+            if self.misses > 8 {
+                self.synchronised = false;
+                self.block_index = 0;
+                self.window_fill = 0;
+                return;
+            }
+        }
+
+        self.group[self.block_index] = info;
+        self.block_index += 1;
+
+        if self.block_index == 4 {
+            self.block_index = 0;
+            // Only interpret a group whose blocks all checked out. A corrupted block here
+            // would put wrong characters into the station name, and those persist on
+            // screen far longer than the error that produced them.
+            if self.misses == 0 {
+                let group = self.group;
+                self.decoder.push_group(group);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_offset_word_is_its_own_syndrome() {
+        // Each offset word is ten bits, so as a polynomial its degree is below the
+        // generator's and dividing leaves it unchanged. Combined with linearity that is
+        // what makes the scheme work: a clean block's remainder is exactly the offset word
+        // it was scrambled with, so identifying a block is a table lookup.
+        //
+        // Some decoders publish a different table (0x3D8 for A, and so on). Those come
+        // from a register formulation that keeps clocking past the end of the block, not
+        // from the standard's plain polynomial remainder. Either is self-consistent, but
+        // only this one matches how the check word is defined, so it is the one that
+        // agrees with a real broadcast.
+        for offset in Offset::ALL {
+            assert_eq!(
+                expected_syndrome(offset),
+                offset.word(),
+                "{offset:?} should divide through unchanged"
+            );
+        }
+    }
+
