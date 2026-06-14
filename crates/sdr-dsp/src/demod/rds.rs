@@ -537,3 +537,271 @@ mod tests {
         }
     }
 
+    #[test]
+    fn check_word_construction_matches_the_standard() {
+        // The check word is the remainder of the information bits raised by the code's
+        // degree, added to the offset. Recomputing it here independently of encode_block
+        // guards against the two drifting apart.
+        let info = 0x3ABCu16;
+        let block = encode_block(info, Offset::B);
+        let expected_check = syndrome((info as u32) << 10, 26) ^ Offset::B.word();
+        assert_eq!((block & 0x3FF) as u16, expected_check);
+        // A clean codeword before scrambling must have a zero remainder.
+        let unscrambled = block ^ Offset::B.word() as u32;
+        assert_eq!(
+            syndrome(unscrambled, 26),
+            0,
+            "codeword did not divide cleanly"
+        );
+    }
+
+    #[test]
+    fn every_offset_has_a_distinct_syndrome() {
+        // If two collided, block identification would be ambiguous.
+        let mut seen = Vec::new();
+        for o in Offset::ALL {
+            let s = expected_syndrome(o);
+            assert!(!seen.contains(&s), "syndrome collision on {o:?}");
+            seen.push(s);
+        }
+    }
+
+    #[test]
+    fn encoded_blocks_classify_back_to_their_offset() {
+        for offset in Offset::ALL {
+            for info in [0x0000u16, 0x1234, 0xFFFF, 0xABCD, 0x5555] {
+                let block = encode_block(info, offset);
+                assert_eq!(
+                    classify(block),
+                    Some(offset),
+                    "info {info:04X} with {offset:?} did not round-trip"
+                );
+                assert_eq!(
+                    ((block >> 10) & 0xFFFF) as u16,
+                    info,
+                    "information bits altered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_bit_error_is_detected() {
+        let block = encode_block(0x1234, Offset::A);
+        for bit in 0..26 {
+            let corrupted = block ^ (1 << bit);
+            assert_ne!(
+                classify(corrupted),
+                Some(Offset::A),
+                "flipping bit {bit} went undetected"
+            );
+        }
+    }
+
+    #[test]
+    fn syndrome_is_linear() {
+        // Linearity is what makes offset scrambling recoverable at all.
+        let a = 0x0123_4567u32 & 0x3FF_FFFF;
+        let b = 0x0089_ABCDu32 & 0x3FF_FFFF;
+        assert_eq!(syndrome(a ^ b, 26), syndrome(a, 26) ^ syndrome(b, 26));
+    }
+
+    /// Assembles a block B word from its named fields, in the standard's bit layout.
+    fn block_b(group_type: u16, version_b: bool, traffic: bool, pty: u16, low5: u16) -> u16 {
+        (group_type << 12)
+            | ((version_b as u16) << 11)
+            | ((traffic as u16) << 10)
+            | (pty << 5)
+            | low5
+    }
+
+    /// Builds the four blocks of a group-0A frame carrying two station-name characters.
+    fn name_group(pi: u16, segment: u16, chars: [u8; 2]) -> [u16; 4] {
+        let b = block_b(0, false, false, 10, segment);
+        [pi, b, 0, ((chars[0] as u16) << 8) | chars[1] as u16]
+    }
+
+    #[test]
+    fn assembles_a_station_name_from_four_fragments() {
+        let mut d = GroupDecoder::new();
+        for (segment, pair) in [*b"RA", *b"DI", *b"O ", *b"FM"].iter().enumerate() {
+            let chars = [pair[0], pair[1]];
+            d.push_group(name_group(0x1234, segment as u16, chars));
+        }
+        assert_eq!(d.state().station_name, "RADIO FM");
+        assert_eq!(d.state().program_id, Some(0x1234));
+        assert_eq!(d.state().program_type, Some(10));
+    }
+
+    #[test]
+    fn withholds_the_name_until_every_fragment_has_arrived() {
+        let mut d = GroupDecoder::new();
+        d.push_group(name_group(0x1234, 0, *b"AB"));
+        d.push_group(name_group(0x1234, 1, *b"CD"));
+        assert_eq!(d.state().station_name, "", "published a half-built name");
+
+        d.push_group(name_group(0x1234, 2, *b"EF"));
+        d.push_group(name_group(0x1234, 3, *b"GH"));
+        assert_eq!(d.state().station_name, "ABCDEFGH");
+    }
+
+    #[test]
+    fn fragments_may_arrive_out_of_order() {
+        let mut d = GroupDecoder::new();
+        for (segment, pair) in [(3u16, *b"GH"), (1, *b"CD"), (0, *b"AB"), (2, *b"EF")] {
+            d.push_group(name_group(0x1234, segment, [pair[0], pair[1]]));
+        }
+        assert_eq!(d.state().station_name, "ABCDEFGH");
+    }
+
+    /// Builds a group-2A frame carrying four characters of radio text.
+    fn text_group(pi: u16, segment: u16, flag: bool, chars: [u8; 4]) -> [u16; 4] {
+        let b = block_b(2, false, false, 10, ((flag as u16) << 4) | segment);
+        [
+            pi,
+            b,
+            ((chars[0] as u16) << 8) | chars[1] as u16,
+            ((chars[2] as u16) << 8) | chars[3] as u16,
+        ]
+    }
+
+    #[test]
+    fn assembles_radio_text_across_segments() {
+        let mut d = GroupDecoder::new();
+        let message = b"Now Playing: Something Long Enough To Span";
+        for (segment, chunk) in message.chunks(4).enumerate() {
+            let mut chars = [b' '; 4];
+            chars[..chunk.len()].copy_from_slice(chunk);
+            d.push_group(text_group(0x1234, segment as u16, false, chars));
+        }
+        assert_eq!(
+            d.state().radio_text,
+            String::from_utf8_lossy(message).trim_end()
+        );
+    }
+
+    #[test]
+    fn a_toggled_text_flag_discards_the_previous_message() {
+        let mut d = GroupDecoder::new();
+        d.push_group(text_group(0x1234, 0, false, *b"OLDS"));
+        d.push_group(text_group(0x1234, 1, false, *b"TUFF"));
+        assert!(d.state().radio_text.starts_with("OLDSTUFF"));
+
+        // The flag flipping means a new message; the old characters must not survive.
+        d.push_group(text_group(0x1234, 0, true, *b"NEW!"));
+        assert!(
+            !d.state().radio_text.contains("STUFF"),
+            "stale text survived the flag toggle: {:?}",
+            d.state().radio_text
+        );
+        assert!(d.state().radio_text.starts_with("NEW!"));
+    }
+
+    #[test]
+    fn a_carriage_return_terminates_the_text() {
+        let mut d = GroupDecoder::new();
+        d.push_group(text_group(0x1234, 0, false, *b"Hi\r "));
+        assert_eq!(d.state().radio_text, "Hi");
+    }
+
+    #[test]
+    fn control_and_high_bytes_are_replaced_rather_than_shown() {
+        let mut d = GroupDecoder::new();
+        for (segment, chars) in [
+            (0u16, [b'O', 0x00]),
+            (1, [b'K', 0xFF]),
+            (2, *b"  "),
+            (3, *b"  "),
+        ] {
+            d.push_group(name_group(0x1234, segment, chars));
+        }
+        let name = &d.state().station_name;
+        assert!(
+            name.chars().all(|c| c.is_ascii_graphic() || c == ' '),
+            "unsanitised: {name:?}"
+        );
+        assert!(name.starts_with('O'));
+    }
+
+    #[test]
+    fn traffic_flag_is_read_from_block_b() {
+        let mut d = GroupDecoder::new();
+        let mut group = name_group(0x1234, 0, *b"AB");
+        group[1] |= 1 << 10;
+        d.push_group(group);
+        assert!(d.state().traffic_program);
+    }
+
+    #[test]
+    fn unknown_group_types_update_the_common_fields_only() {
+        let mut d = GroupDecoder::new();
+        // Group type 8 carries traffic message data this decoder does not interpret.
+        let b = block_b(8, false, false, 5, 0);
+        d.push_group([0xBEEF, b, 0x1111, 0x2222]);
+
+        assert_eq!(d.state().program_id, Some(0xBEEF));
+        assert_eq!(d.state().program_type, Some(5));
+        assert_eq!(d.state().station_name, "");
+        assert_eq!(d.state().groups_decoded, 1);
+    }
+
+    #[test]
+    fn block_error_rate_reflects_the_counters() {
+        let mut s = RdsState::default();
+        assert_eq!(s.block_error_rate(), 0.0);
+        s.blocks_valid = 90;
+        s.blocks_invalid = 10;
+        assert!((s.block_error_rate() - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bit_level_sync_locks_onto_an_encoded_stream() {
+        // Drive the sliding-window sync directly with a known bitstream, bypassing the
+        // signal path. This is the layer that has to find block boundaries with no framing.
+        let groups = [
+            name_group(0x1234, 0, *b"TE"),
+            name_group(0x1234, 1, *b"ST"),
+            name_group(0x1234, 2, *b"IN"),
+            name_group(0x1234, 3, *b"G!"),
+        ];
+
+        let mut decoder = RdsDecoder::new(240_000.0);
+        // Lead in with arbitrary bits so sync has to actually search rather than start
+        // aligned by luck.
+        for k in 0..37 {
+            decoder.push_bit(k % 3 == 0);
+        }
+        // Repeat the sequence so every name fragment is seen after sync is acquired.
+        for _ in 0..3 {
+            for group in &groups {
+                for (idx, info) in group.iter().enumerate() {
+                    let offset = match idx {
+                        0 => Offset::A,
+                        1 => Offset::B,
+                        2 => Offset::C,
+                        _ => Offset::D,
+                    };
+                    let block = encode_block(*info, offset);
+                    for bit in (0..26).rev() {
+                        decoder.push_bit((block >> bit) & 1 == 1);
+                    }
+                }
+            }
+        }
+
+        assert!(decoder.is_synchronised(), "never acquired block sync");
+        assert_eq!(decoder.state().station_name, "TESTING!");
+        assert_eq!(decoder.state().program_id, Some(0x1234));
+        assert!(
+            decoder.state().blocks_invalid == 0,
+            "{} blocks failed their syndrome check",
+            decoder.state().blocks_invalid
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "headroom above the 57 kHz subcarrier")]
+    fn rejects_a_rate_that_cannot_carry_the_subcarrier() {
+        RdsDecoder::new(48_000.0);
+    }
+}
