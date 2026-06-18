@@ -1,0 +1,14 @@
+[package]
+name = "sdr-rtl"
+description = "Transport-agnostic RTL2832U and R828D tuner driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints.rust]
+missing_debug_implementations = "warn"
