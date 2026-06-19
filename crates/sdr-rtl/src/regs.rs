@@ -492,3 +492,255 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejects_rates_the_converter_cannot_reach() {
+        assert_eq!(sample_rate(200_000, RTL_XTAL), Err(RateError::TooLow));
+        assert_eq!(sample_rate(225_000, RTL_XTAL), Err(RateError::TooLow));
+        assert_eq!(sample_rate(3_300_000, RTL_XTAL), Err(RateError::TooHigh));
+        assert_eq!(
+            sample_rate(500_000, RTL_XTAL),
+            Err(RateError::UnsupportedGap)
+        );
+        assert_eq!(
+            sample_rate(900_000, RTL_XTAL),
+            Err(RateError::UnsupportedGap)
+        );
+        // Either side of the gap is fine.
+        assert!(sample_rate(300_000, RTL_XTAL).is_ok());
+        assert!(sample_rate(900_001, RTL_XTAL).is_ok());
+    }
+
+    #[test]
+    fn if_frequency_registers_match_worked_values() {
+        // The default 3.57 MHz IF, and the 4.57 MHz one used for wide bandwidths.
+        assert_eq!(if_frequency(3_570_000, RTL_XTAL), [0x38, 0x11, 0x12]);
+        assert_eq!(if_frequency(4_570_000, RTL_XTAL), [0x35, 0xD8, 0x2E]);
+        assert_eq!(if_frequency(2_300_000, RTL_XTAL), [0x3A, 0xE3, 0x8F]);
+    }
+
+    #[test]
+    fn if_frequency_is_negated() {
+        // A zero IF is the only value that is its own negation; anything else must come
+        // back with the top bit of the 22-bit field set.
+        assert_eq!(if_frequency(0, RTL_XTAL), [0x00, 0x00, 0x00]);
+        let nonzero = if_frequency(1_000_000, RTL_XTAL);
+        assert!(nonzero[0] & 0x20 != 0, "negation lost: {nonzero:02X?}");
+    }
+
+    #[test]
+    fn frequency_correction_is_signed() {
+        assert_eq!(frequency_correction(0), [0x00, 0x00]);
+        let positive = frequency_correction(10);
+        let negative = frequency_correction(-10);
+        assert_ne!(positive, negative, "correction ignored the sign");
+    }
+
+    #[test]
+    fn the_tuner_cannot_reach_hf_which_is_why_the_upconverter_exists() {
+        // Even the largest divider leaves the oscillator below its minimum for anything
+        // under about 27.7 MHz, so the synthesiser has no solution. Routing HF through the
+        // upconverter is not an optimisation, it is the only way to receive it at all.
+        assert_eq!(
+            compute_pll(7_100_000, RTL_XTAL, 1, 1),
+            Err(PllError::OutOfRange)
+        );
+        assert_eq!(
+            compute_pll(24_000_000, RTL_XTAL, 1, 1),
+            Err(PllError::OutOfRange)
+        );
+
+        // Upconverted, the same frequencies are comfortably in range.
+        assert!(compute_pll(tuner_frequency(7_100_000), RTL_XTAL, 1, 1).is_ok());
+        assert!(compute_pll(tuner_frequency(24_000_000), RTL_XTAL, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn pll_covers_the_tuner_range() {
+        for freq in [
+            30_000_000u32,
+            100_000_000,
+            433_000_000,
+            900_000_000,
+            1_700_000_000,
+        ] {
+            let pll = compute_pll(freq, RTL_XTAL, 1, 1)
+                .unwrap_or_else(|e| panic!("{freq} Hz failed: {e:?}"));
+            // The chosen divider must land the oscillator inside its usable window.
+            let vco_khz = (freq as u64 / 1000) * pll.mix_div as u64;
+            assert!(
+                (VCO_MIN_KHZ..VCO_MAX_KHZ).contains(&vco_khz),
+                "{freq} Hz put the oscillator at {vco_khz} kHz with divider {}",
+                pll.mix_div
+            );
+        }
+    }
+
+    #[test]
+    fn pll_dividers_reconstruct_the_requested_frequency() {
+        // The synthesiser output is (nint + sdm/65536) * 2 * xtal / mix_div. Recomputing
+        // it is the only check that catches a wrong divider that still looks plausible.
+        for freq in [50_000_000u32, 145_000_000, 433_920_000, 868_000_000] {
+            let pll = compute_pll(freq, RTL_XTAL, 1, 1).unwrap();
+            let fractional = pll.nint as f64 + pll.sdm as f64 / 65536.0;
+            let reconstructed = fractional * 2.0 * RTL_XTAL as f64 / pll.mix_div as f64;
+            let error = (reconstructed - freq as f64).abs();
+            assert!(
+                error < 500.0,
+                "{freq} Hz reconstructed as {reconstructed} (off by {error} Hz)"
+            );
+        }
+    }
+
+    #[test]
+    fn pll_packs_the_integer_divider_into_its_two_fields() {
+        let pll = compute_pll(433_000_000, RTL_XTAL, 1, 1).unwrap();
+        // Register 0x14 holds ni in the low six bits and si in the top two.
+        let ni = (pll.reg_14 & 0x3F) as u32;
+        let si = (pll.reg_14 >> 6) as u32;
+        assert_eq!(
+            4 * ni + si + 13,
+            pll.nint,
+            "divider did not round-trip through 0x14"
+        );
+    }
+
+    #[test]
+    fn pll_rejects_frequencies_outside_the_tuner_range() {
+        // Far below what any divider can reach.
+        assert_eq!(
+            compute_pll(1_000_000, RTL_XTAL, 1, 1),
+            Err(PllError::OutOfRange)
+        );
+        // Far above.
+        assert_eq!(
+            compute_pll(3_000_000_000, RTL_XTAL, 1, 1),
+            Err(PllError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn using_the_wrong_crystal_shifts_every_calculation() {
+        // The Blog V4 clocks its tuner at 28.8 MHz where a conventional R828D board uses
+        // 16 MHz. Assuming the wrong one is the single most common way to get a receiver
+        // that tunes to entirely the wrong frequency, so pin the difference down.
+        let correct = compute_pll(100_000_000, 28_800_000, 1, 1).unwrap();
+        let wrong = compute_pll(100_000_000, 16_000_000, 1, 1).unwrap();
+        assert_ne!(correct.nint, wrong.nint, "crystal choice had no effect");
+
+        let ratio = 28_800_000.0 / 16_000_000.0;
+        let implied = wrong.nint as f64 / correct.nint as f64;
+        assert!(
+            (implied - ratio).abs() < 0.05,
+            "expected the divider to scale by {ratio}, got {implied}"
+        );
+    }
+
+    #[test]
+    fn band_selection_follows_the_triplexer() {
+        assert_eq!(band_for(0), Band::Hf);
+        assert_eq!(band_for(7_100_000), Band::Hf);
+        assert_eq!(band_for(28_800_000), Band::Hf);
+        assert_eq!(band_for(28_800_001), Band::Vhf);
+        assert_eq!(band_for(100_000_000), Band::Vhf);
+        assert_eq!(band_for(249_999_999), Band::Vhf);
+        assert_eq!(band_for(250_000_000), Band::Uhf);
+        assert_eq!(band_for(433_000_000), Band::Uhf);
+    }
+
+    #[test]
+    fn upconversion_and_band_selection_agree_at_the_crossover() {
+        // Exactly at the crossover the reference driver takes the HF path without
+        // upconverting, leaving the tuner an upconverter away from the signal. Both sides
+        // of the decision must use the same comparison.
+        let f = UPCONVERT_CROSSOVER;
+        assert_eq!(band_for(f), Band::Hf);
+        assert_eq!(
+            tuner_frequency(f),
+            f + UPCONVERT_CROSSOVER,
+            "HF band without upconversion leaves the tuner mistuned"
+        );
+    }
+
+    #[test]
+    fn upconversion_applies_below_the_crossover_only() {
+        assert_eq!(tuner_frequency(7_100_000), 7_100_000 + 28_800_000);
+        assert_eq!(tuner_frequency(14_200_000), 43_000_000);
+        assert_eq!(tuner_frequency(100_000_000), 100_000_000);
+        assert_eq!(tuner_frequency(433_000_000), 433_000_000);
+    }
+
+    #[test]
+    fn upconverted_hf_lands_inside_the_tuner_range() {
+        // The tuner cannot go below roughly 24 MHz, which is the entire reason the
+        // upconverter exists. Every HF frequency must come out above that.
+        for freq in [0u32, 1_000, 500_000, 7_100_000, 28_800_000] {
+            assert!(
+                tuner_frequency(freq) >= 28_800_000,
+                "{freq} Hz upconverted to {}",
+                tuner_frequency(freq)
+            );
+        }
+    }
+
+    #[test]
+    fn notches_are_bypassed_inside_the_bands_they_protect_against() {
+        // Broadcast AM, broadcast FM and DAB: notching these while tuned to them would
+        // attenuate the wanted signal.
+        assert!(!notch_engaged(1_000_000), "AM broadcast");
+        assert!(!notch_engaged(98_000_000), "FM broadcast");
+        assert!(!notch_engaged(200_000_000), "DAB");
+
+        assert!(notch_engaged(7_100_000), "40 m amateur");
+        assert!(notch_engaged(145_000_000), "2 m amateur");
+        assert!(notch_engaged(433_000_000), "70 cm amateur");
+    }
+
+    #[test]
+    fn gain_distribution_is_monotonic_and_bounded() {
+        let mut previous = 0;
+        for target in (0..500).step_by(10) {
+            let g = distribute_gain(target);
+            assert!(
+                g.lna_index < 16 && g.mixer_index < 16,
+                "index out of range at {target}"
+            );
+            assert!(
+                g.achieved >= previous,
+                "gain went backwards at {target}: {} after {previous}",
+                g.achieved
+            );
+            assert!(
+                g.achieved <= target,
+                "overshot {target} with {}",
+                g.achieved
+            );
+            previous = g.achieved;
+        }
+    }
+
+    #[test]
+    fn zero_gain_selects_the_bottom_of_both_stages() {
+        let g = distribute_gain(0);
+        assert_eq!((g.lna_index, g.mixer_index, g.achieved), (0, 0, 0));
+    }
+
+    #[test]
+    fn maximum_gain_saturates_rather_than_wrapping() {
+        let g = distribute_gain(10_000);
+        assert!(g.lna_index < 16 && g.mixer_index < 16);
+        assert!(
+            g.achieved > 400,
+            "expected close to full gain, got {}",
+            g.achieved
+        );
+    }
+
+    #[test]
+    fn nearest_gain_snaps_to_the_table() {
+        assert_eq!(nearest_gain(0), 0);
+        assert_eq!(nearest_gain(500), 496);
+        assert_eq!(nearest_gain(-100), 0);
+        assert_eq!(nearest_gain(10), 9);
+        assert!(GAIN_VALUES.contains(&nearest_gain(300)));
+    }
+}
