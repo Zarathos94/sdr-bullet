@@ -253,3 +253,242 @@ pub fn compute_pll(
 ) -> Result<PllSetting, PllError> {
     let freq_khz = (freq_hz as u64 + 500) / 1000;
 
+    // Pick the smallest divider that puts the oscillator inside its usable range.
+    let mut mix_div: u32 = 2;
+    let mut div_num: i32 = 0;
+    let mut found = false;
+    while mix_div <= 64 {
+        let vco = freq_khz * mix_div as u64;
+        if (VCO_MIN_KHZ..VCO_MAX_KHZ).contains(&vco) {
+            found = true;
+            break;
+        }
+        mix_div <<= 1;
+        div_num += 1;
+    }
+    if !found {
+        return Err(PllError::OutOfRange);
+    }
+
+    // The oscillator reports which side of centre it is sitting on; shifting the divider
+    // moves it back before it runs out of tuning range.
+    if vco_fine_tune > vco_power_ref {
+        div_num -= 1;
+    } else if vco_fine_tune < vco_power_ref {
+        div_num += 1;
+    }
+    let div_num = div_num.clamp(0, 5) as u8;
+
+    // Integer-exact fractional division. Working in 64-bit here rather than reproducing
+    // the reference's iterative halving loop gives the same answer without accumulating
+    // rounding at each step.
+    let vco_freq = freq_hz as u64 * mix_div as u64;
+    let pll_ref = xtal_hz as u64;
+    let vco_div = (pll_ref + 65536 * vco_freq) / (2 * pll_ref);
+    let nint = (vco_div / 65536) as u32;
+    let sdm = (vco_div % 65536) as u16;
+
+    if nint > (128 / vco_power_ref as u32) - 1 {
+        return Err(PllError::DividerTooLarge);
+    }
+
+    // The integer divider is stored as a quotient and remainder about 13, not directly.
+    let ni = (nint - 13) / 4;
+    let si = nint - 4 * ni - 13;
+
+    Ok(PllSetting {
+        mix_div,
+        div_num,
+        nint,
+        sdm,
+        reg_14: (ni + (si << 6)) as u8,
+        reg_15: (sdm & 0xFF) as u8,
+        reg_16: (sdm >> 8) as u8,
+        power_down_sdm: sdm == 0,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Blog V4 front end
+// ---------------------------------------------------------------------------
+
+/// Which port of the triplexer a frequency arrives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Band {
+    /// Through the upconverter and into the tuner's second cable input.
+    Hf,
+    /// Directly into the tuner's first cable input.
+    Vhf,
+    /// Directly into the tuner's antenna input.
+    Uhf,
+}
+
+/// Selects the triplexer port for a frequency.
+pub fn band_for(freq_hz: u32) -> Band {
+    if freq_hz <= UPCONVERT_CROSSOVER {
+        Band::Hf
+    } else if freq_hz < VHF_UHF_BOUNDARY {
+        Band::Vhf
+    } else {
+        Band::Uhf
+    }
+}
+
+/// Frequency the tuner should be asked for, accounting for the upconverter.
+///
+/// The reference driver uses a strict comparison here while selecting the band with a
+/// non-strict one, so a request for exactly the crossover frequency takes the HF path
+/// without being upconverted — the tuner then looks 28.8 MHz away from the signal. Both
+/// comparisons are non-strict here so the two agree.
+pub fn tuner_frequency(freq_hz: u32) -> u32 {
+    if freq_hz <= UPCONVERT_CROSSOVER {
+        freq_hz + UPCONVERT_CROSSOVER
+    } else {
+        freq_hz
+    }
+}
+
+/// Whether the switchable notch filters should be engaged at this frequency.
+///
+/// The notches attenuate the broadcast AM, broadcast FM and DAB bands, which are strong
+/// enough to desensitise the front end from outside the wanted channel. They are bypassed
+/// when the receiver is tuned into one of those bands, since notching the thing you are
+/// trying to hear defeats the purpose.
+pub fn notch_engaged(freq_hz: u32) -> bool {
+    let in_broadcast_band = freq_hz <= 2_200_000
+        || (85_000_000..=112_000_000).contains(&freq_hz)
+        || (172_000_000..=242_000_000).contains(&freq_hz);
+    !in_broadcast_band
+}
+
+// ---------------------------------------------------------------------------
+// Tuner gain
+// ---------------------------------------------------------------------------
+
+/// Incremental gain of each low-noise amplifier step, in tenths of a decibel.
+pub const LNA_STEPS: [i32; 16] = [0, 9, 13, 40, 38, 13, 31, 22, 26, 31, 26, 14, 19, 5, 35, 13];
+
+/// Incremental gain of each mixer step, in tenths of a decibel.
+pub const MIXER_STEPS: [i32; 16] = [0, 5, 10, 10, 19, 9, 10, 25, 17, 10, 8, 16, 13, 6, 3, -8];
+
+/// Gain settings the tuner can actually reach, in tenths of a decibel.
+pub const GAIN_VALUES: [i32; 29] = [
+    0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364, 372,
+    386, 402, 421, 434, 439, 445, 480, 496,
+];
+
+/// Amplifier index positions for a requested gain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GainSetting {
+    pub lna_index: u8,
+    pub mixer_index: u8,
+    /// Total gain actually achieved, in tenths of a decibel.
+    pub achieved: i32,
+}
+
+/// Distributes a requested gain across the low-noise amplifier and mixer stages.
+///
+/// The two are stepped alternately rather than filling one before the other, which keeps
+/// both away from the ends of their ranges where their steps are least well behaved — note
+/// that the tables are not monotonic, and the mixer's last step is negative.
+pub fn distribute_gain(target_tenths: i32) -> GainSetting {
+    let mut total = 0;
+    let mut lna_index = 0u8;
+    let mut mixer_index = 0u8;
+
+    for step in 1..16 {
+        let next_lna = total + LNA_STEPS[step];
+        if next_lna >= target_tenths {
+            break;
+        }
+        total = next_lna;
+        lna_index = step as u8;
+
+        let next_mixer = total + MIXER_STEPS[step];
+        if next_mixer >= target_tenths {
+            break;
+        }
+        total = next_mixer;
+        mixer_index = step as u8;
+    }
+
+    GainSetting {
+        lna_index,
+        mixer_index,
+        achieved: total,
+    }
+}
+
+/// Snaps a gain in tenths of a decibel to the nearest value the tuner supports.
+pub fn nearest_gain(target_tenths: i32) -> i32 {
+    *GAIN_VALUES
+        .iter()
+        .min_by_key(|g| (**g - target_tenths).abs())
+        .expect("gain table is never empty")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_transfer_encodings_match_the_wire_format() {
+        // Flat blocks put the address in wValue and the block in the high byte of wIndex.
+        assert_eq!(block_read(0x2000, Block::Usb), (0x2000, 0x0100));
+        assert_eq!(block_write(0x2000, Block::Usb), (0x2000, 0x0110));
+        assert_eq!(block_write(0x3000, Block::Sys), (0x3000, 0x0210));
+
+        // The demodulator does not: the address moves into wValue's high byte.
+        assert_eq!(demod_read(1, 0x01), (0x0120, 0x0001));
+        assert_eq!(demod_write(1, 0x01), (0x0120, 0x0011));
+        assert_eq!(demod_write(0, 0x19), (0x1920, 0x0010));
+
+        // Tuner access goes through the I2C block at a fixed index.
+        assert_eq!(i2c_write(0x74), (0x0074, 0x0610));
+        assert_eq!(i2c_read(0x74), (0x0074, 0x0600));
+    }
+
+    #[test]
+    fn multi_byte_values_are_sent_most_significant_first() {
+        assert_eq!(encode_value(0x1002, 2).as_slice(), &[0x10, 0x02]);
+        assert_eq!(encode_value(0x0002, 2).as_slice(), &[0x00, 0x02]);
+        assert_eq!(encode_value(0x09, 1).as_slice(), &[0x09]);
+    }
+
+    #[test]
+    fn sample_rate_ratios_match_worked_values() {
+        // Computed from the reference formula; the common rates all divide exactly.
+        let cases = [
+            (2_048_000u32, 0x0384_0000u32, 0x0384u16, 0x0000u16),
+            (2_400_000, 0x0300_0000, 0x0300, 0x0000),
+            (3_200_000, 0x0240_0000, 0x0240, 0x0000),
+            (250_000, 0x0CCC_CCCC, 0x0CCC, 0xCCCC),
+        ];
+        for (rate, ratio, high, low) in cases {
+            let got = sample_rate(rate, RTL_XTAL).expect("rate should be valid");
+            assert_eq!(got.ratio, ratio, "ratio for {rate}");
+            assert_eq!(got.high, high, "high half for {rate}");
+            assert_eq!(got.low, low, "low half for {rate}");
+        }
+    }
+
+    #[test]
+    fn common_rates_come_back_exactly() {
+        for rate in [2_048_000u32, 2_400_000, 3_200_000, 1_024_000] {
+            let s = sample_rate(rate, RTL_XTAL).unwrap();
+            let actual = achieved_rate(s.ratio, RTL_XTAL);
+            assert!(
+                (actual - rate as f64).abs() < 1.0,
+                "{rate} came back as {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn resampler_ratio_is_always_a_multiple_of_four() {
+        for rate in [226_000u32, 250_000, 1_000_000, 2_400_000, 3_200_000] {
+            let s = sample_rate(rate, RTL_XTAL).unwrap();
+            assert_eq!(s.ratio & 0x3, 0, "ratio for {rate} was not aligned");
+        }
+    }
+
