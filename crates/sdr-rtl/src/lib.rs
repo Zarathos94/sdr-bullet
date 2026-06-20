@@ -12,5 +12,7 @@
 //! failure is debuggable, before anything depends on them inside a worker.
 
 pub mod regs;
+pub mod transport;
 
 pub use regs::{Band, GainSetting, PllSetting, SampleRate};
+pub use transport::{ControlRequest, Direction, Transport};
