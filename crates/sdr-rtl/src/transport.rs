@@ -156,3 +156,166 @@ impl MockTransport {
         })
     }
 
+    /// Position of a matching write in the log, for asserting on ordering.
+    pub fn position_of(&self, value: u16, index: u16) -> Option<usize> {
+        self.log.iter().position(
+            |r| matches!(r, Recorded::Out { value: v, index: i, .. } if *v == value && *i == index),
+        )
+    }
+
+    pub fn clear(&mut self) {
+        self.log.clear();
+    }
+
+    fn check_failure(&self) -> Result<(), TransportError> {
+        match self.fail_after {
+            Some(n) if self.log.len() >= n => Err(TransportError::Disconnected),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Transport for MockTransport {
+    async fn control_out(
+        &mut self,
+        request: ControlRequest,
+        data: &[u8],
+    ) -> Result<(), TransportError> {
+        self.check_failure()?;
+        self.log.push(Recorded::Out {
+            value: request.value,
+            index: request.index,
+            data: data.to_vec(),
+        });
+        Ok(())
+    }
+
+    async fn control_in(
+        &mut self,
+        request: ControlRequest,
+        data: &mut [u8],
+    ) -> Result<usize, TransportError> {
+        self.check_failure()?;
+        self.log.push(Recorded::In {
+            value: request.value,
+            index: request.index,
+            len: data.len(),
+        });
+        match self.responses.pop_front() {
+            Some(response) => {
+                let n = response.len().min(data.len());
+                data[..n].copy_from_slice(&response[..n]);
+                Ok(n)
+            }
+            None => {
+                data.fill(0);
+                Ok(data.len())
+            }
+        }
+    }
+
+    async fn bulk_in(&mut self, data: &mut [u8]) -> Result<usize, TransportError> {
+        self.check_failure()?;
+        self.log.push(Recorded::Bulk { len: data.len() });
+        data.fill(0x7F);
+        Ok(data.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs a future to completion on the current thread.
+    ///
+    /// The driver's futures never actually suspend against a mock transport — every
+    /// operation resolves immediately — so a real executor would be a dependency bought
+    /// for nothing.
+    pub fn block_on<F: core::future::Future>(mut future: F) -> F::Output {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(core::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        // SAFETY: every vtable entry is a no-op that ignores its data pointer.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: `future` is owned by this frame and never moved after being pinned.
+        let mut future = unsafe { core::pin::Pin::new_unchecked(&mut future) };
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+
+    #[test]
+    fn records_writes_in_order() {
+        let mut t = MockTransport::new();
+        block_on(async {
+            t.control_out(ControlRequest::write(0x2000, 0x0110), &[0x09])
+                .await
+                .unwrap();
+            t.control_out(ControlRequest::write(0x3000, 0x0210), &[0xE8])
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(t.writes().len(), 2);
+        assert!(t.wrote(0x2000, 0x0110, &[0x09]));
+        assert!(t.wrote(0x3000, 0x0210, &[0xE8]));
+        assert!(t.position_of(0x2000, 0x0110) < t.position_of(0x3000, 0x0210));
+    }
+
+    #[test]
+    fn replays_queued_responses_then_falls_back_to_zeroes() {
+        let mut t = MockTransport::new();
+        t.push_response([0x69]);
+
+        block_on(async {
+            let mut buf = [0u8; 1];
+            t.control_in(ControlRequest::read(0x0074, 0x0600), &mut buf)
+                .await
+                .unwrap();
+            assert_eq!(buf[0], 0x69);
+
+            // With nothing queued, a read looks like an absent device rather than stale data.
+            t.control_in(ControlRequest::read(0x0074, 0x0600), &mut buf)
+                .await
+                .unwrap();
+            assert_eq!(buf[0], 0x00);
+        });
+    }
+
+    #[test]
+    fn failure_injection_stops_further_transfers() {
+        let mut t = MockTransport::new();
+        t.fail_after = Some(1);
+        block_on(async {
+            t.control_out(ControlRequest::write(1, 2), &[0])
+                .await
+                .unwrap();
+            let err = t
+                .control_out(ControlRequest::write(3, 4), &[0])
+                .await
+                .unwrap_err();
+            assert_eq!(err, TransportError::Disconnected);
+        });
+    }
+
+    #[test]
+    fn wrote_does_not_match_on_a_different_payload() {
+        let mut t = MockTransport::new();
+        block_on(async {
+            t.control_out(ControlRequest::write(0x2000, 0x0110), &[0x09])
+                .await
+                .unwrap();
+        });
+        assert!(t.wrote(0x2000, 0x0110, &[0x09]));
+        assert!(!t.wrote(0x2000, 0x0110, &[0x08]));
+        assert!(!t.wrote(0x2001, 0x0110, &[0x09]));
+    }
+}
