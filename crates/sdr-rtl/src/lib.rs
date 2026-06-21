@@ -12,7 +12,9 @@
 //! failure is debuggable, before anything depends on them inside a worker.
 
 pub mod regs;
+pub mod rtl2832;
 pub mod transport;
 
 pub use regs::{Band, GainSetting, PllSetting, SampleRate};
+pub use rtl2832::Rtl2832;
 pub use transport::{ControlRequest, Direction, Transport};
