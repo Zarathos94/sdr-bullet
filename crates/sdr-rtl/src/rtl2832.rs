@@ -258,3 +258,272 @@ impl<T: Transport> Rtl2832<T> {
 
     // -- Initialisation -----------------------------------------------------
 
+    /// Brings the demodulator up into software-defined-radio mode.
+    ///
+    /// The order matters throughout. Powering the demodulator before the USB endpoint is
+    /// configured, or programming the filter before the soft reset, leaves the part in a
+    /// state that only shows up much later as a stream that never starts.
+    pub async fn init_baseband(&mut self) -> Result<(), TransportError> {
+        // USB endpoint first, so the bulk path exists before anything can drive it.
+        self.write_reg(Block::Usb, regs::usb::SYSCTL, 0x09, 1)
+            .await?;
+        self.write_reg(Block::Usb, regs::usb::EPA_MAXPKT, 0x0002, 2)
+            .await?;
+        self.write_reg(Block::Usb, regs::usb::EPA_CTL, 0x1002, 2)
+            .await?;
+
+        // Power up the demodulator.
+        self.write_reg(Block::Sys, regs::sys::DEMOD_CTL_1, 0x22, 1)
+            .await?;
+        self.write_reg(Block::Sys, regs::sys::DEMOD_CTL, 0xE8, 1)
+            .await?;
+
+        // Soft reset: assert then release.
+        self.demod_write(1, 0x01, 0x14, 1).await?;
+        self.demod_write(1, 0x01, 0x10, 1).await?;
+
+        // Clear the spectrum-inversion and offset registers before they are set properly.
+        self.demod_write(1, 0x15, 0x00, 1).await?;
+        self.demod_write(1, 0x16, 0x0000, 2).await?;
+        for offset in 0..6u16 {
+            self.demod_write(1, 0x16 + offset, 0x00, 1).await?;
+        }
+
+        // Decimating filter, twenty bytes across consecutive registers.
+        let fir = pack_fir(&FIR_COEFFICIENTS);
+        for (offset, byte) in fir.iter().enumerate() {
+            self.demod_write(1, 0x1C + offset as u16, *byte as u16, 1)
+                .await?;
+        }
+
+        // Software-defined-radio mode, with the digital gain control off.
+        self.demod_write(0, 0x19, 0x05, 1).await?;
+
+        // State machine thresholds.
+        self.demod_write(1, 0x93, 0xF0, 1).await?;
+        self.demod_write(1, 0x94, 0x0F, 1).await?;
+
+        // Disable the broadcast television automatic gain loops, which would otherwise
+        // fight whatever gain the tuner is set to.
+        self.demod_write(1, 0x11, 0x00, 1).await?;
+        self.demod_write(1, 0x04, 0x00, 1).await?;
+
+        // No transport-stream filtering, and the default converter data path.
+        self.demod_write(0, 0x61, 0x60, 1).await?;
+        self.demod_write(0, 0x06, 0x80, 1).await?;
+
+        // Zero intermediate frequency with offset cancellation and quadrature correction.
+        self.demod_write(1, 0xB1, 0x1B, 1).await?;
+
+        // Stop driving the 4.096 MHz test clock onto a pin.
+        self.demod_write(0, 0x0D, 0x83, 1).await?;
+
+        Ok(())
+    }
+
+    /// Switches the data path to suit an R82xx tuner.
+    ///
+    /// These parts present a real intermediate frequency rather than quadrature baseband,
+    /// so the converter runs single-ended and the demodulator undoes both the offset and
+    /// the spectral flip the tuner's high-side mixing introduces.
+    pub async fn configure_for_r82xx(&mut self) -> Result<(), TransportError> {
+        self.demod_write(1, 0xB1, 0x1A, 1).await?;
+        self.demod_write(0, 0x08, 0x4D, 1).await?;
+        self.set_if_frequency(DEFAULT_IF_HZ).await?;
+        // The tuner mixes from above, which inverts the spectrum; this puts it back.
+        self.demod_write(1, 0x15, 0x01, 1).await?;
+        Ok(())
+    }
+
+    /// Programs the demodulator's intermediate frequency offset.
+    pub async fn set_if_frequency(&mut self, if_hz: u32) -> Result<(), TransportError> {
+        let [hi, mid, lo] = regs::if_frequency(if_hz, self.xtal);
+        self.demod_write(1, 0x19, hi as u16, 1).await?;
+        self.demod_write(1, 0x1A, mid as u16, 1).await?;
+        self.demod_write(1, 0x1B, lo as u16, 1).await?;
+        Ok(())
+    }
+
+    /// Programs the sample rate, returning the rate actually achieved.
+    ///
+    /// The requested rate is a ratio against the crystal and rarely lands exactly, so the
+    /// caller has to use the returned value for anything rate-dependent downstream.
+    pub async fn set_sample_rate(&mut self, rate: u32) -> Result<f64, TransportError> {
+        let setting = regs::sample_rate(rate, self.xtal)
+            .map_err(|e| TransportError::Io(format!("unsupported sample rate: {e:?}")))?;
+
+        self.demod_write(1, 0x9F, setting.high, 2).await?;
+        self.demod_write(1, 0xA1, setting.low, 2).await?;
+        self.set_frequency_correction(0).await?;
+
+        // The resampler needs a reset before the new ratio takes effect.
+        self.demod_write(1, 0x01, 0x14, 1).await?;
+        self.demod_write(1, 0x01, 0x10, 1).await?;
+
+        Ok(regs::achieved_rate(setting.ratio, self.xtal))
+    }
+
+    /// Trims the sample clock, in parts per million.
+    pub async fn set_frequency_correction(&mut self, ppm: i32) -> Result<(), TransportError> {
+        let [hi, lo] = regs::frequency_correction(ppm);
+        self.demod_write(1, 0x3E, hi as u16, 1).await?;
+        self.demod_write(1, 0x3F, lo as u16, 1).await?;
+        Ok(())
+    }
+
+    /// Enables the demodulator's own digital gain control.
+    ///
+    /// Independent of the tuner's gain, and usually best left off — it operates after the
+    /// converter, so it cannot recover anything the tuner already clipped.
+    pub async fn set_agc(&mut self, enabled: bool) -> Result<(), TransportError> {
+        self.demod_write(0, 0x19, if enabled { 0x25 } else { 0x05 }, 1)
+            .await
+    }
+
+    // -- Streaming ----------------------------------------------------------
+
+    /// Clears whatever the endpoint has buffered.
+    ///
+    /// Without this the first read returns samples captured before the current tuning,
+    /// which shows up as a fraction of a second of the previous frequency at every retune.
+    pub async fn reset_buffer(&mut self) -> Result<(), TransportError> {
+        self.write_reg(Block::Usb, regs::usb::EPA_CTL, 0x1002, 2)
+            .await?;
+        self.write_reg(Block::Usb, regs::usb::EPA_CTL, 0x0000, 2)
+            .await
+    }
+
+    /// Reads raw interleaved samples, returning how many bytes arrived.
+    pub async fn read_samples(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        self.transport.bulk_in(buf).await
+    }
+
+    /// Checks that a tuner is present and answering at the given address.
+    pub async fn probe_tuner(&mut self, i2c_addr: u8) -> Result<bool, TransportError> {
+        self.set_i2c_repeater(true).await?;
+        let mut buf = [0u8; 1];
+        let result = self.tuner_read(i2c_addr, &mut buf).await;
+        self.set_i2c_repeater(false).await?;
+        result?;
+        Ok(buf[0] == R82XX_CHECK_VALUE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::MockTransport;
+
+    /// Minimal executor. Nothing in the driver suspends against a mock transport.
+    fn block_on<F: core::future::Future>(mut future: F) -> F::Output {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(core::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        // SAFETY: every vtable entry ignores its data pointer and does nothing.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: the future is owned here and never moved after pinning.
+        let mut future = unsafe { core::pin::Pin::new_unchecked(&mut future) };
+        loop {
+            if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    fn driver() -> Rtl2832<MockTransport> {
+        let mut d = Rtl2832::new(MockTransport::new());
+        // The read-back after each write triples the log length and obscures what the
+        // ordering assertions are actually about.
+        d.set_verify_demod_writes(false);
+        d
+    }
+
+    #[test]
+    fn fir_packing_matches_the_register_layout() {
+        let packed = pack_fir(&FIR_COEFFICIENTS);
+        assert_eq!(packed.len(), 20);
+
+        // First eight are plain signed bytes.
+        assert_eq!(packed[0], (-54i32) as i8 as u8);
+        assert_eq!(packed[7], 53);
+
+        // The next eight are twelve-bit, three bytes per pair. Unpack and compare.
+        for pair in 0..4 {
+            let base = 8 + pair * 3;
+            let first = ((packed[base] as u32) << 4) | ((packed[base + 1] as u32) >> 4);
+            let second = (((packed[base + 1] as u32) & 0x0F) << 8) | packed[base + 2] as u32;
+            assert_eq!(
+                first as i32,
+                FIR_COEFFICIENTS[8 + pair * 2],
+                "pair {pair} first"
+            );
+            assert_eq!(
+                second as i32,
+                FIR_COEFFICIENTS[8 + pair * 2 + 1],
+                "pair {pair} second"
+            );
+        }
+    }
+
+    #[test]
+    fn init_configures_usb_before_powering_the_demodulator() {
+        let mut d = driver();
+        block_on(d.init_baseband()).unwrap();
+        let t = d.into_transport();
+
+        let usb = t
+            .position_of(regs::usb::SYSCTL, 0x0110)
+            .expect("USB SYSCTL never written");
+        let power = t
+            .position_of(regs::sys::DEMOD_CTL, 0x0210)
+            .expect("demodulator never powered");
+        assert!(
+            usb < power,
+            "powered the demodulator before configuring the endpoint"
+        );
+    }
+
+    #[test]
+    fn init_writes_the_documented_startup_values() {
+        let mut d = driver();
+        block_on(d.init_baseband()).unwrap();
+        let t = d.into_transport();
+
+        assert!(t.wrote(regs::usb::SYSCTL, 0x0110, &[0x09]));
+        assert!(t.wrote(regs::usb::EPA_MAXPKT, 0x0110, &[0x00, 0x02]));
+        assert!(t.wrote(regs::usb::EPA_CTL, 0x0110, &[0x10, 0x02]));
+        assert!(t.wrote(regs::sys::DEMOD_CTL_1, 0x0210, &[0x22]));
+        assert!(t.wrote(regs::sys::DEMOD_CTL, 0x0210, &[0xE8]));
+
+        // Software-defined-radio mode, and the test clock switched off.
+        let (v, i) = regs::demod_write(0, 0x19);
+        assert!(t.wrote(v, i, &[0x05]), "never entered SDR mode");
+        let (v, i) = regs::demod_write(0, 0x0D);
+        assert!(t.wrote(v, i, &[0x83]));
+    }
+
+    #[test]
+    fn soft_reset_asserts_then_releases() {
+        let mut d = driver();
+        block_on(d.init_baseband()).unwrap();
+        let t = d.into_transport();
+
+        let (v, i) = regs::demod_write(1, 0x01);
+        let resets: Vec<_> = t
+            .writes()
+            .into_iter()
+            .filter(|(wv, wi, _)| *wv == v && *wi == i)
+            .map(|(_, _, data)| data[0])
+            .collect();
+        assert_eq!(
+            resets,
+            vec![0x14, 0x10],
+            "reset was not asserted then released"
+        );
+    }
+
