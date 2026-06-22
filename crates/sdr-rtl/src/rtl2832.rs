@@ -527,3 +527,259 @@ mod tests {
         );
     }
 
+    #[test]
+    fn init_programs_all_twenty_filter_bytes() {
+        let mut d = driver();
+        block_on(d.init_baseband()).unwrap();
+        let t = d.into_transport();
+
+        let expected = pack_fir(&FIR_COEFFICIENTS);
+        for (offset, byte) in expected.iter().enumerate() {
+            let (v, i) = regs::demod_write(1, 0x1C + offset as u16);
+            assert!(
+                t.wrote(v, i, &[*byte]),
+                "filter byte {offset} (0x{byte:02X}) never written"
+            );
+        }
+    }
+
+    #[test]
+    fn r82xx_configuration_inverts_the_spectrum() {
+        // High-side mixing in the tuner flips the spectrum; leaving this unset puts every
+        // signal on the wrong side of centre.
+        let mut d = driver();
+        block_on(d.configure_for_r82xx()).unwrap();
+        let t = d.into_transport();
+
+        let (v, i) = regs::demod_write(1, 0x15);
+        assert!(t.wrote(v, i, &[0x01]), "spectrum inversion never enabled");
+
+        let (v, i) = regs::demod_write(1, 0xB1);
+        assert!(t.wrote(v, i, &[0x1A]), "zero-IF path not disabled");
+
+        let (v, i) = regs::demod_write(0, 0x08);
+        assert!(
+            t.wrote(v, i, &[0x4D]),
+            "converter not switched to single-ended"
+        );
+    }
+
+    #[test]
+    fn sample_rate_writes_both_halves_and_resets() {
+        let mut d = driver();
+        let actual = block_on(d.set_sample_rate(2_400_000)).unwrap();
+        assert!((actual - 2_400_000.0).abs() < 1.0, "achieved rate {actual}");
+
+        let t = d.into_transport();
+        let (v, i) = regs::demod_write(1, 0x9F);
+        assert!(t.wrote(v, i, &[0x03, 0x00]), "high half of the ratio wrong");
+        let (v, i) = regs::demod_write(1, 0xA1);
+        assert!(t.wrote(v, i, &[0x00, 0x00]), "low half of the ratio wrong");
+
+        // The ratio only takes effect after a reset.
+        let (rv, ri) = regs::demod_write(1, 0x01);
+        assert!(t.wrote(rv, ri, &[0x14]));
+    }
+
+    #[test]
+    fn an_unsupported_sample_rate_is_refused_before_any_transfer() {
+        let mut d = driver();
+        let err = block_on(d.set_sample_rate(500_000)).unwrap_err();
+        assert!(matches!(err, TransportError::Io(_)));
+        assert!(
+            d.into_transport().log.is_empty(),
+            "touched the device before validating the rate"
+        );
+    }
+
+    #[test]
+    fn if_frequency_writes_three_registers() {
+        let mut d = driver();
+        block_on(d.set_if_frequency(DEFAULT_IF_HZ)).unwrap();
+        let t = d.into_transport();
+
+        let expected = regs::if_frequency(DEFAULT_IF_HZ, regs::RTL_XTAL);
+        for (offset, byte) in expected.iter().enumerate() {
+            let (v, i) = regs::demod_write(1, 0x19 + offset as u16);
+            assert!(t.wrote(v, i, &[*byte]), "IF byte {offset} wrong");
+        }
+    }
+
+    #[test]
+    fn i2c_repeater_toggles_the_documented_values() {
+        let mut d = driver();
+        block_on(async {
+            d.set_i2c_repeater(true).await.unwrap();
+            d.set_i2c_repeater(false).await.unwrap();
+        });
+        let t = d.into_transport();
+        let (v, i) = regs::demod_write(1, 0x01);
+        let values: Vec<_> = t
+            .writes()
+            .into_iter()
+            .filter(|(wv, wi, _)| *wv == v && *wi == i)
+            .map(|(_, _, data)| data[0])
+            .collect();
+        assert_eq!(values, vec![0x18, 0x10]);
+    }
+
+    #[test]
+    fn tuner_reads_are_passed_through_unaltered() {
+        // Measured against a Blog V4: register 0 arrives as 0x69, the value that
+        // identifies the part. Reversing the bits on the way through — as several
+        // reference implementations do — would turn it into 0x96 and make the tuner
+        // look absent.
+        let mut d = driver();
+        d.transport_mut().push_response([R82XX_CHECK_VALUE]);
+
+        let mut buf = [0u8; 1];
+        block_on(d.tuner_read(R828D_I2C_ADDR, &mut buf)).unwrap();
+        assert_eq!(buf[0], R82XX_CHECK_VALUE);
+    }
+
+    #[test]
+    fn probing_finds_a_tuner_that_answers_correctly() {
+        let mut d = driver();
+        d.transport_mut().push_response([R82XX_CHECK_VALUE]);
+        assert!(block_on(d.probe_tuner(R828D_I2C_ADDR)).unwrap());
+
+        let mut absent = driver();
+        absent.transport_mut().push_response([0x00u8]);
+        assert!(!block_on(absent.probe_tuner(R828D_I2C_ADDR)).unwrap());
+    }
+
+    #[test]
+    fn probing_brackets_the_read_with_the_repeater() {
+        let mut d = driver();
+        d.transport_mut().push_response([R82XX_CHECK_VALUE]);
+        block_on(d.probe_tuner(R828D_I2C_ADDR)).unwrap();
+
+        let t = d.into_transport();
+        let (v, i) = regs::demod_write(1, 0x01);
+        let toggles: Vec<_> = t
+            .writes()
+            .into_iter()
+            .filter(|(wv, wi, _)| *wv == v && *wi == i)
+            .map(|(_, _, data)| data[0])
+            .collect();
+        assert_eq!(
+            toggles,
+            vec![0x18, 0x10],
+            "repeater not opened and closed around the read"
+        );
+    }
+
+    #[test]
+    fn tuner_writes_carry_register_then_value() {
+        let mut d = driver();
+        block_on(d.tuner_write(R828D_I2C_ADDR, 0x1A, 0x40)).unwrap();
+        let t = d.into_transport();
+        let (v, i) = regs::i2c_write(R828D_I2C_ADDR);
+        assert!(t.wrote(v, i, &[0x1A, 0x40]));
+    }
+
+    #[test]
+    fn burst_writes_prefix_the_starting_register() {
+        let mut d = driver();
+        block_on(d.tuner_write_burst(R828D_I2C_ADDR, 0x05, &[0x83, 0x30, 0x75])).unwrap();
+        let t = d.into_transport();
+        let (v, i) = regs::i2c_write(R828D_I2C_ADDR);
+        assert!(t.wrote(v, i, &[0x05, 0x83, 0x30, 0x75]));
+    }
+
+    #[test]
+    fn long_bursts_are_split_and_the_register_advances() {
+        // The bus master stalls on anything longer than eight bytes including the address,
+        // so a twenty-seven register run has to become several messages.
+        let mut d = driver();
+        let values: Vec<u8> = (0..27).collect();
+        block_on(d.tuner_write_burst(R828D_I2C_ADDR, 0x05, &values)).unwrap();
+
+        let t = d.into_transport();
+        let (v, i) = regs::i2c_write(R828D_I2C_ADDR);
+        let messages: Vec<Vec<u8>> = t
+            .writes()
+            .into_iter()
+            .filter(|(wv, wi, _)| *wv == v && *wi == i)
+            .map(|(_, _, data)| data)
+            .collect();
+
+        assert!(messages.len() > 1, "a 27-byte run was not split");
+        for message in &messages {
+            assert!(
+                message.len() <= MAX_I2C_MSG_LEN,
+                "message of {} bytes exceeds the bus limit",
+                message.len()
+            );
+        }
+
+        // Reassembling the payloads must reproduce the original run, with each message
+        // addressed to where its slice belongs.
+        let mut rebuilt = Vec::new();
+        for message in &messages {
+            assert_eq!(
+                message[0],
+                0x05 + rebuilt.len() as u8,
+                "message addressed to the wrong register"
+            );
+            rebuilt.extend_from_slice(&message[1..]);
+        }
+        assert_eq!(rebuilt, values);
+    }
+
+    #[test]
+    fn buffer_reset_cycles_the_endpoint() {
+        let mut d = driver();
+        block_on(d.reset_buffer()).unwrap();
+        let t = d.into_transport();
+        let writes: Vec<_> = t
+            .writes()
+            .into_iter()
+            .filter(|(v, i, _)| *v == regs::usb::EPA_CTL && *i == 0x0110)
+            .map(|(_, _, data)| data)
+            .collect();
+        assert_eq!(writes, vec![vec![0x10, 0x02], vec![0x00, 0x00]]);
+    }
+
+    #[test]
+    fn verified_writes_add_a_read_back() {
+        let mut plain = Rtl2832::new(MockTransport::new());
+        plain.set_verify_demod_writes(false);
+        block_on(plain.demod_write(1, 0x01, 0x10, 1)).unwrap();
+        assert_eq!(plain.into_transport().log.len(), 1);
+
+        let mut verified = Rtl2832::new(MockTransport::new());
+        verified.set_verify_demod_writes(true);
+        block_on(verified.demod_write(1, 0x01, 0x10, 1)).unwrap();
+        assert_eq!(
+            verified.into_transport().log.len(),
+            2,
+            "read-back missing, which is what doubles the round trips"
+        );
+    }
+
+    #[test]
+    fn gpio_configuration_sets_direction_before_driving() {
+        let mut d = driver();
+        block_on(d.set_bias_tee(true)).unwrap();
+        let t = d.into_transport();
+
+        let direction = t
+            .position_of(regs::sys::GPD, 0x0210)
+            .expect("direction never set");
+        let output = t
+            .position_of(regs::sys::GPO, 0x0210)
+            .expect("pin never driven");
+        assert!(
+            direction < output,
+            "drove the pin before making it an output"
+        );
+    }
+
+    #[test]
+    fn transport_failures_propagate() {
+        let mut d = driver();
+        d.transport_mut().fail_after = Some(0);
+        assert!(block_on(d.init_baseband()).is_err());
+    }
+}
