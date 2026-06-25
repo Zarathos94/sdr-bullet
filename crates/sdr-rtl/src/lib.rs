@@ -11,10 +11,12 @@
 //! register sequences can be exercised against real hardware from a terminal, where a
 //! failure is debuggable, before anything depends on them inside a worker.
 
+pub mod r82xx;
 pub mod regs;
 pub mod rtl2832;
 pub mod transport;
 
+pub use r82xx::{GainMode, R82xx};
 pub use regs::{Band, GainSetting, PllSetting, SampleRate};
 pub use rtl2832::Rtl2832;
 pub use transport::{ControlRequest, Direction, Transport};
