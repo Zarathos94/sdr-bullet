@@ -190,3 +190,192 @@ impl<T: Transport> R82xx<T> {
         let air_in = if band == Band::Uhf { 0x00 } else { 0x20 };
         self.write_mask(rtl, 0x05, air_in, 0x20).await?;
 
+        // Pin 5 enables the upconverter on later boards, low for HF. Earlier boards leave
+        // it running and ignore this, so driving it is harmless either way.
+        rtl.set_i2c_repeater(false).await?;
+        rtl.set_gpio_output(5).await?;
+        rtl.write_gpio(5, band != Band::Hf).await?;
+        rtl.set_i2c_repeater(true).await?;
+
+        Ok(())
+    }
+
+    /// Engages or bypasses the broadcast notch filters.
+    async fn set_notch(
+        &mut self,
+        rtl: &mut Rtl2832<T>,
+        freq_hz: u32,
+    ) -> Result<(), TransportError> {
+        let value = if regs::notch_engaged(freq_hz) {
+            0x08
+        } else {
+            0x00
+        };
+        self.write_mask(rtl, 0x17, value, 0x08).await
+    }
+
+    /// Programs the synthesiser to `lo_hz`.
+    async fn set_pll(&mut self, rtl: &mut Rtl2832<T>, lo_hz: u32) -> Result<(), TransportError> {
+        // Reference divider straight through, and autotune at its finest step.
+        self.write_mask(rtl, 0x10, 0x00, 0x10).await?;
+        self.write_mask(rtl, 0x1A, 0x00, 0x0C).await?;
+        self.write_mask(rtl, 0x12, 0x80, 0xE0).await?;
+
+        // Register 4 reports whether the oscillator is running above or below centre for
+        // its current divider; the calculation shifts the divider to bring it back.
+        let mut status = [0u8; 5];
+        rtl.tuner_read(self.i2c_addr, &mut status).await?;
+        let vco_fine_tune = (status[4] & 0x30) >> 4;
+
+        let pll = regs::compute_pll(lo_hz, self.xtal, vco_fine_tune, VCO_POWER_REF)
+            .map_err(|e| TransportError::Io(format!("cannot tune to {lo_hz} Hz: {e:?}")))?;
+
+        self.write_mask(rtl, 0x10, pll.div_num << 5, 0xE0).await?;
+        self.write(rtl, 0x14, pll.reg_14).await?;
+        // The fractional path can be powered down when the division comes out exact,
+        // which removes its spurs.
+        self.write_mask(
+            rtl,
+            0x12,
+            if pll.power_down_sdm { 0x08 } else { 0x00 },
+            0x08,
+        )
+        .await?;
+        self.write(rtl, 0x16, pll.reg_16).await?;
+        self.write(rtl, 0x15, pll.reg_15).await?;
+
+        Ok(())
+    }
+
+    /// Reads back whether the synthesiser has locked.
+    pub async fn is_locked(&mut self, rtl: &mut Rtl2832<T>) -> Result<bool, TransportError> {
+        rtl.set_i2c_repeater(true).await?;
+        let mut status = [0u8; 3];
+        let result = rtl.tuner_read(self.i2c_addr, &mut status).await;
+        rtl.set_i2c_repeater(false).await?;
+        result?;
+        Ok(status[2] & 0x40 != 0)
+    }
+
+    /// Sets the gain, either fixed or under the tuner's own control.
+    pub async fn set_gain(
+        &mut self,
+        rtl: &mut Rtl2832<T>,
+        mode: GainMode,
+    ) -> Result<(), TransportError> {
+        rtl.set_i2c_repeater(true).await?;
+
+        match mode {
+            GainMode::Automatic => {
+                self.write_mask(rtl, 0x05, 0x00, 0x10).await?;
+                self.write_mask(rtl, 0x07, 0x10, 0x10).await?;
+                // A fixed 26.5 dB on the variable stage, which is what the tuner's loops
+                // are tuned around.
+                self.write_mask(rtl, 0x0C, 0x0B, 0x9F).await?;
+            }
+            GainMode::Manual(tenths) => {
+                // Both automatic loops off before touching the manual indices, or they
+                // will move again immediately.
+                self.write_mask(rtl, 0x05, 0x10, 0x10).await?;
+                self.write_mask(rtl, 0x07, 0x00, 0x10).await?;
+                self.write_mask(rtl, 0x0C, 0x08, 0x9F).await?;
+
+                let setting = regs::distribute_gain(tenths);
+                self.write_mask(rtl, 0x05, setting.lna_index, 0x0F).await?;
+                self.write_mask(rtl, 0x07, setting.mixer_index, 0x0F)
+                    .await?;
+            }
+        }
+
+        rtl.set_i2c_repeater(false).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::MockTransport;
+
+    fn block_on<F: core::future::Future>(mut future: F) -> F::Output {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(core::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        // SAFETY: every vtable entry ignores its data pointer and does nothing.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: the future is owned here and never moved after pinning.
+        let mut future = unsafe { core::pin::Pin::new_unchecked(&mut future) };
+        loop {
+            if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    fn rig() -> (Rtl2832<MockTransport>, R82xx<MockTransport>) {
+        let mut rtl = Rtl2832::new(MockTransport::new());
+        rtl.set_verify_demod_writes(false);
+        (rtl, R82xx::new_v4())
+    }
+
+    /// Every tuner write recorded, as `(register, value)`.
+    fn tuner_writes(log: &MockTransport) -> Vec<(u8, u8)> {
+        let (v, i) = regs::i2c_write(R828D_I2C_ADDR);
+        log.writes()
+            .into_iter()
+            .filter(|(wv, wi, data)| *wv == v && *wi == i && data.len() == 2)
+            .map(|(_, _, data)| (data[0], data[1]))
+            .collect()
+    }
+
+    #[test]
+    fn the_v4_clocks_its_tuner_from_the_shared_reference() {
+        // This is the whole difference between a V4 and a conventional R828D board, and
+        // getting it wrong scales every synthesiser calculation by 1.8.
+        assert_eq!(R82xx::<MockTransport>::new_v4().xtal(), 28_800_000);
+        assert_eq!(
+            R82xx::<MockTransport>::new_legacy_r828d().xtal(),
+            16_000_000
+        );
+    }
+
+    #[test]
+    fn init_writes_every_register_in_the_set() {
+        let (mut rtl, mut tuner) = rig();
+        block_on(tuner.init(&mut rtl)).unwrap();
+        let log = rtl.into_transport();
+
+        // The run is split across several messages by the bus limit, so reassemble it
+        // rather than looking for one transfer.
+        let (v, i) = regs::i2c_write(R828D_I2C_ADDR);
+        let mut rebuilt = Vec::new();
+        for (wv, wi, data) in log.writes() {
+            if wv == v && wi == i && data[0] == FIRST_REG + rebuilt.len() as u8 {
+                rebuilt.extend_from_slice(&data[1..]);
+            }
+        }
+        assert_eq!(rebuilt, INIT_REGS.to_vec(), "init register set incomplete");
+    }
+
+    #[test]
+    fn masked_writes_preserve_neighbouring_bits() {
+        let (mut rtl, mut tuner) = rig();
+        // Register 0x05 starts at 0x83. Setting only the low nibble must leave 0x80 alone.
+        block_on(tuner.write_mask(&mut rtl, 0x05, 0x0A, 0x0F)).unwrap();
+        assert_eq!(tuner.shadow(0x05), 0x8A);
+
+        // And touching the automatic-gain bit must not disturb the index just written.
+        block_on(tuner.write_mask(&mut rtl, 0x05, 0x10, 0x10)).unwrap();
+        assert_eq!(tuner.shadow(0x05), 0x9A);
+    }
+
+    #[test]
+    fn hf_selects_the_second_cable_input() {
+        let (mut rtl, mut tuner) = rig();
+        block_on(tuner.set_frequency(&mut rtl, 7_100_000)).unwrap();
+
