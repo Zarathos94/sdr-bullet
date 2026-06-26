@@ -379,3 +379,197 @@ mod tests {
         let (mut rtl, mut tuner) = rig();
         block_on(tuner.set_frequency(&mut rtl, 7_100_000)).unwrap();
 
+        assert_eq!(tuner.band(), Some(Band::Hf));
+        // Cable 2 on, cable 1 off, antenna input deselected.
+        assert_eq!(tuner.shadow(0x06) & 0x08, 0x08, "HF port not selected");
+        assert_eq!(tuner.shadow(0x05) & 0x40, 0x00, "VHF port still selected");
+        assert_eq!(
+            tuner.shadow(0x05) & 0x20,
+            0x20,
+            "antenna input still selected"
+        );
+    }
+
+    #[test]
+    fn vhf_and_uhf_select_their_own_inputs() {
+        let (mut rtl, mut tuner) = rig();
+        block_on(tuner.set_frequency(&mut rtl, 100_000_000)).unwrap();
+        assert_eq!(tuner.band(), Some(Band::Vhf));
+        assert_eq!(tuner.shadow(0x05) & 0x40, 0x40, "VHF port not selected");
+        assert_eq!(tuner.shadow(0x06) & 0x08, 0x00, "HF port still selected");
+
+        block_on(tuner.set_frequency(&mut rtl, 433_000_000)).unwrap();
+        assert_eq!(tuner.band(), Some(Band::Uhf));
+        // Inverted sense: cleared means selected.
+        assert_eq!(
+            tuner.shadow(0x05) & 0x20,
+            0x00,
+            "antenna input not selected"
+        );
+        assert_eq!(tuner.shadow(0x05) & 0x40, 0x00, "VHF port still selected");
+    }
+
+    #[test]
+    fn hf_bypasses_the_tracking_filter_on_every_tune() {
+        // Selecting the mux reasserts the tracking filter, so a bypass applied only on a
+        // band change is silently undone by the next tune within HF.
+        let (mut rtl, mut tuner) = rig();
+        block_on(tuner.set_frequency(&mut rtl, 7_100_000)).unwrap();
+        let first = rtl.transport_mut().log.len();
+        rtl.transport_mut().clear();
+
+        block_on(tuner.set_frequency(&mut rtl, 14_200_000)).unwrap();
+        let log = rtl.into_transport();
+        let writes = tuner_writes(&log);
+
+        assert!(first > 0);
+        assert!(
+            writes.iter().any(|(reg, _)| *reg == 0x1B),
+            "tracking filter bypass not reapplied on a second HF tune"
+        );
+    }
+
+    #[test]
+    fn band_switching_is_skipped_when_the_band_is_unchanged() {
+        let (mut rtl, mut tuner) = rig();
+        block_on(tuner.set_frequency(&mut rtl, 100_000_000)).unwrap();
+        rtl.transport_mut().clear();
+
+        // A second VHF frequency should not rewrite the mux.
+        block_on(tuner.set_frequency(&mut rtl, 105_000_000)).unwrap();
+        let log = rtl.into_transport();
+        let writes = tuner_writes(&log);
+        assert!(
+            !writes.iter().any(|(reg, _)| *reg == 0x06),
+            "rewrote the mux without changing band"
+        );
+    }
+
+    #[test]
+    fn notch_state_follows_the_frequency_not_the_band() {
+        let (mut rtl, mut tuner) = rig();
+
+        // Inside broadcast FM the notch is bypassed.
+        block_on(tuner.set_frequency(&mut rtl, 98_000_000)).unwrap();
+        assert_eq!(
+            tuner.shadow(0x17) & 0x08,
+            0x00,
+            "notch engaged inside FM broadcast"
+        );
+
+        // Still VHF, but outside the broadcast band, so it engages.
+        block_on(tuner.set_frequency(&mut rtl, 145_000_000)).unwrap();
+        assert_eq!(
+            tuner.shadow(0x17) & 0x08,
+            0x08,
+            "notch not engaged outside FM broadcast"
+        );
+    }
+
+    #[test]
+    fn hf_tuning_targets_the_upconverted_frequency() {
+        let (mut rtl, mut tuner) = rig();
+        block_on(tuner.set_frequency(&mut rtl, 7_100_000)).unwrap();
+        let log = rtl.into_transport();
+        let writes = tuner_writes(&log);
+
+        // Recover the divider settings and check they describe the upconverted frequency
+        // plus the intermediate frequency, not the requested one.
+        let reg_14 = writes
+            .iter()
+            .rev()
+            .find(|(r, _)| *r == 0x14)
+            .expect("no divider write")
+            .1;
+        let reg_16 = writes
+            .iter()
+            .rev()
+            .find(|(r, _)| *r == 0x16)
+            .expect("no fraction high")
+            .1;
+        let reg_15 = writes
+            .iter()
+            .rev()
+            .find(|(r, _)| *r == 0x15)
+            .expect("no fraction low")
+            .1;
+
+        let expected_lo = regs::tuner_frequency(7_100_000) + crate::rtl2832::DEFAULT_IF_HZ;
+        let expected = regs::compute_pll(expected_lo, regs::RTL_XTAL, 0, VCO_POWER_REF).unwrap();
+        assert_eq!(reg_14, expected.reg_14);
+        assert_eq!(reg_16, expected.reg_16);
+        assert_eq!(reg_15, expected.reg_15);
+    }
+
+    #[test]
+    fn manual_gain_disables_both_automatic_loops_first() {
+        let (mut rtl, mut tuner) = rig();
+        block_on(tuner.set_gain(&mut rtl, GainMode::Manual(300))).unwrap();
+
+        // Automatic low-noise-amplifier control off, automatic mixer control off.
+        assert_eq!(tuner.shadow(0x05) & 0x10, 0x10, "LNA loop still running");
+        assert_eq!(tuner.shadow(0x07) & 0x10, 0x00, "mixer loop still running");
+
+        let expected = regs::distribute_gain(300);
+        assert_eq!(tuner.shadow(0x05) & 0x0F, expected.lna_index);
+        assert_eq!(tuner.shadow(0x07) & 0x0F, expected.mixer_index);
+    }
+
+    #[test]
+    fn automatic_gain_hands_control_back_to_the_tuner() {
+        let (mut rtl, mut tuner) = rig();
+        block_on(tuner.set_gain(&mut rtl, GainMode::Manual(300))).unwrap();
+        block_on(tuner.set_gain(&mut rtl, GainMode::Automatic)).unwrap();
+
+        assert_eq!(tuner.shadow(0x05) & 0x10, 0x00, "LNA loop not re-enabled");
+        assert_eq!(tuner.shadow(0x07) & 0x10, 0x10, "mixer loop not re-enabled");
+    }
+
+    #[test]
+    fn tuning_is_bracketed_by_the_i2c_repeater() {
+        let (mut rtl, mut tuner) = rig();
+        block_on(tuner.set_frequency(&mut rtl, 100_000_000)).unwrap();
+        let log = rtl.into_transport();
+
+        let (v, i) = regs::demod_write(1, 0x01);
+        let toggles: Vec<u8> = log
+            .writes()
+            .into_iter()
+            .filter(|(wv, wi, _)| *wv == v && *wi == i)
+            .map(|(_, _, data)| data[0])
+            .collect();
+
+        assert_eq!(toggles.first(), Some(&0x18), "repeater not opened first");
+        assert_eq!(toggles.last(), Some(&0x10), "repeater left open");
+    }
+
+    #[test]
+    fn lock_status_is_read_from_the_third_register() {
+        let (mut rtl, mut tuner) = rig();
+        // Bit 6 of register 2 is the lock indicator.
+        rtl.transport_mut().push_response(vec![0u8, 0, 0x40, 0, 0]);
+        assert!(block_on(tuner.is_locked(&mut rtl)).unwrap());
+
+        let (mut rtl2, mut tuner2) = rig();
+        rtl2.transport_mut().push_response(vec![0u8; 5]);
+        assert!(!block_on(tuner2.is_locked(&mut rtl2)).unwrap());
+    }
+
+    #[test]
+    fn an_unreachable_frequency_is_reported_rather_than_programmed() {
+        let (mut rtl, mut tuner) = rig();
+        // Above what any divider can reach, and not low enough to be upconverted.
+        let err = block_on(tuner.set_frequency(&mut rtl, 2_500_000_000)).unwrap_err();
+        assert!(
+            matches!(err, TransportError::Io(_)),
+            "expected a reported failure, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn writing_outside_the_register_window_is_rejected() {
+        let (mut rtl, mut tuner) = rig();
+        block_on(tuner.write(&mut rtl, 0x02, 0x00)).unwrap();
+    }
+}
