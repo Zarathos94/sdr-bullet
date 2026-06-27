@@ -104,3 +104,115 @@ impl NusbTransport {
             )
         })?;
 
+        let interface = device.claim_interface(0).wait().map_err(|e| {
+            format!(
+                "cannot claim the interface: {e}\n\
+                 This usually means the kernel's DVB driver has it. Blacklist \
+                 dvb_usb_rtl28xxu and unplug and replug the device."
+            )
+        })?;
+
+        Ok((
+            Self {
+                device,
+                interface,
+                reader: None,
+                timeout: Duration::from_millis(500),
+            },
+            found,
+        ))
+    }
+
+    /// Opens the bulk endpoint and starts the transfer pipeline.
+    ///
+    /// Kept separate from opening the device because the endpoint has to be started after
+    /// the demodulator is configured, not before — a reader running against an
+    /// unconfigured device returns whatever the endpoint had buffered from last time.
+    pub fn start_stream(&mut self) -> Result<(), String> {
+        let endpoint = self
+            .interface
+            .endpoint::<Bulk, In>(0x81)
+            .map_err(|e| format!("cannot open the sample endpoint: {e}"))?;
+        let reader = endpoint
+            .reader(BULK_CHUNK)
+            .with_num_transfers(TRANSFERS_IN_FLIGHT);
+        self.reader = Some(Box::new(reader));
+        Ok(())
+    }
+
+    pub fn stop_stream(&mut self) {
+        self.reader = None;
+    }
+}
+
+fn map_error(e: nusb::transfer::TransferError) -> TransportError {
+    use nusb::transfer::TransferError;
+    match e {
+        TransferError::Disconnected => TransportError::Disconnected,
+        TransferError::Stall => TransportError::Stalled,
+        other => TransportError::Io(other.to_string()),
+    }
+}
+
+impl Transport for NusbTransport {
+    async fn control_out(
+        &mut self,
+        request: ControlRequest,
+        data: &[u8],
+    ) -> Result<(), TransportError> {
+        debug_assert_eq!(request.direction, Direction::Out);
+        self.device
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
+                    request: 0,
+                    value: request.value,
+                    index: request.index,
+                    data,
+                },
+                self.timeout,
+            )
+            .wait()
+            .map_err(map_error)
+    }
+
+    async fn control_in(
+        &mut self,
+        request: ControlRequest,
+        data: &mut [u8],
+    ) -> Result<usize, TransportError> {
+        debug_assert_eq!(request.direction, Direction::In);
+        let response = self
+            .device
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
+                    request: 0,
+                    value: request.value,
+                    index: request.index,
+                    length: data.len() as u16,
+                },
+                self.timeout,
+            )
+            .wait()
+            .map_err(map_error)?;
+
+        let n = response.len().min(data.len());
+        data[..n].copy_from_slice(&response[..n]);
+        Ok(n)
+    }
+
+    async fn bulk_in(&mut self, data: &mut [u8]) -> Result<usize, TransportError> {
+        use std::io::Read;
+        let reader = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| TransportError::Io("stream not started".into()))?;
+        reader
+            .read_exact(data)
+            .map(|_| data.len())
+            .map_err(|e| TransportError::Io(e.to_string()))
+    }
+}
