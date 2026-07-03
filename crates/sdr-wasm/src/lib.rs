@@ -16,6 +16,10 @@
 //! sizes fixed then — nothing in a `process` call may allocate. That constraint is why the
 //! stages take a maximum block size up front rather than sizing to whatever arrives.
 
+pub mod receiver;
+
+pub use receiver::Receiver;
+
 use wasm_bindgen::prelude::*;
 
 use sdr_dsp::agc::{Agc, Deemphasis, Emphasis};
