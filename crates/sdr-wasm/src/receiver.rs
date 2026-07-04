@@ -150,3 +150,151 @@ pub struct Receiver {
     sample_rate: f64,
 }
 
+fn to_js(error: TransportError) -> JsValue {
+    JsValue::from_str(&error.to_string())
+}
+
+#[wasm_bindgen]
+impl Receiver {
+    /// Brings a device up from cold.
+    ///
+    /// `transport` is an object exposing `controlOut`, `controlIn` and `readSamples`.
+    /// `is_v4` comes from the USB descriptor strings on the JavaScript side — it is not
+    /// discoverable over the bus, and it decides which reference clock every synthesiser
+    /// calculation uses.
+    #[wasm_bindgen(js_name = open)]
+    pub async fn open(transport: JsValue, is_v4: bool) -> Result<Receiver, JsValue> {
+        let bridge = JsTransport::new(transport).map_err(to_js)?;
+        let mut rtl = Rtl2832::new(bridge);
+
+        rtl.init_baseband().await.map_err(to_js)?;
+
+        let present = rtl.probe_tuner(R828D_I2C_ADDR).await.map_err(to_js)?;
+        if !present {
+            return Err(JsValue::from_str(
+                "No R828D tuner answered at 0x74. An older V3 board answers at 0x34 and is \
+                 not supported by this driver.",
+            ));
+        }
+
+        let mut tuner = if is_v4 {
+            R82xx::new_v4()
+        } else {
+            R82xx::new_legacy_r828d()
+        };
+        tuner.init(&mut rtl).await.map_err(to_js)?;
+        rtl.configure_for_r82xx().await.map_err(to_js)?;
+
+        Ok(Receiver {
+            rtl,
+            tuner,
+            tuned_hz: 0,
+            sample_rate: 0.0,
+        })
+    }
+
+    /// Programs the sample rate, returning the rate actually achieved.
+    ///
+    /// The rate is a ratio against a crystal and rarely lands exactly where it was asked,
+    /// so everything downstream has to use the returned value.
+    #[wasm_bindgen(js_name = setSampleRate)]
+    pub async fn set_sample_rate(&mut self, rate: u32) -> Result<f64, JsValue> {
+        let actual = self.rtl.set_sample_rate(rate).await.map_err(to_js)?;
+        self.sample_rate = actual;
+        Ok(actual)
+    }
+
+    #[wasm_bindgen(js_name = setFrequency)]
+    pub async fn set_frequency(&mut self, hz: u32) -> Result<(), JsValue> {
+        self.tuner
+            .set_frequency(&mut self.rtl, hz)
+            .await
+            .map_err(to_js)?;
+        self.tuned_hz = hz;
+        Ok(())
+    }
+
+    /// Fixed gain in tenths of a decibel, or automatic when `tenths` is negative.
+    #[wasm_bindgen(js_name = setGain)]
+    pub async fn set_gain(&mut self, tenths: i32) -> Result<(), JsValue> {
+        let mode = if tenths < 0 {
+            GainMode::Automatic
+        } else {
+            GainMode::Manual(regs::nearest_gain(tenths))
+        };
+        self.tuner
+            .set_gain(&mut self.rtl, mode)
+            .await
+            .map_err(to_js)
+    }
+
+    /// Enables the demodulator's own digital gain control, which is independent of the
+    /// tuner's and usually best left off — it runs after the converter, so it cannot
+    /// recover anything the tuner has already clipped.
+    #[wasm_bindgen(js_name = setDigitalAgc)]
+    pub async fn set_digital_agc(&mut self, enabled: bool) -> Result<(), JsValue> {
+        self.rtl.set_agc(enabled).await.map_err(to_js)
+    }
+
+    #[wasm_bindgen(js_name = setBiasTee)]
+    pub async fn set_bias_tee(&mut self, enabled: bool) -> Result<(), JsValue> {
+        self.rtl.set_bias_tee(enabled).await.map_err(to_js)
+    }
+
+    #[wasm_bindgen(js_name = setFrequencyCorrection)]
+    pub async fn set_frequency_correction(&mut self, ppm: i32) -> Result<(), JsValue> {
+        self.rtl.set_frequency_correction(ppm).await.map_err(to_js)
+    }
+
+    /// Discards whatever the endpoint has buffered.
+    ///
+    /// Without this the first samples after a retune are still from the previous
+    /// frequency, which sounds like a fraction of a second of the old station.
+    #[wasm_bindgen(js_name = resetBuffer)]
+    pub async fn reset_buffer(&mut self) -> Result<(), JsValue> {
+        self.rtl.reset_buffer().await.map_err(to_js)
+    }
+
+    /// Whether the tuner's synthesiser has acquired. A false reading after tuning means
+    /// the requested frequency is outside what the dividers can reach.
+    #[wasm_bindgen(js_name = isLocked)]
+    pub async fn is_locked(&mut self) -> Result<bool, JsValue> {
+        self.tuner.is_locked(&mut self.rtl).await.map_err(to_js)
+    }
+
+    #[wasm_bindgen(getter, js_name = tunedHz)]
+    pub fn tuned_hz(&self) -> u32 {
+        self.tuned_hz
+    }
+
+    #[wasm_bindgen(getter, js_name = sampleRate)]
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
+    /// Which port of the triplexer the current frequency arrives on, for the display.
+    #[wasm_bindgen(getter, js_name = band)]
+    pub fn band(&self) -> String {
+        match regs::band_for(self.tuned_hz) {
+            regs::Band::Hf => "HF",
+            regs::Band::Vhf => "VHF",
+            regs::Band::Uhf => "UHF",
+        }
+        .to_string()
+    }
+
+    /// What the synthesiser was actually asked for.
+    ///
+    /// Below 28.8 MHz this differs from the tuned frequency, because the signal reaches
+    /// the tuner through the board's upconverter rather than directly.
+    #[wasm_bindgen(getter, js_name = tunerFrequencyHz)]
+    pub fn tuner_frequency_hz(&self) -> u32 {
+        regs::tuner_frequency(self.tuned_hz)
+    }
+}
+
+/// Gain settings the tuner can actually reach, in tenths of a decibel.
+#[wasm_bindgen(js_name = supportedGains)]
+pub fn supported_gains() -> Vec<i32> {
+    regs::GAIN_VALUES.to_vec()
+}
