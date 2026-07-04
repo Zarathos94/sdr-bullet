@@ -1,0 +1,15 @@
+{
+  "//": "The AudioWorklet runs in its own global scope with a different set of types from the window and worker scopes — AudioWorkletProcessor and registerProcessor exist there and nowhere else, and the @types/audioworklet globals collide with the DOM lib if both are in scope at once. So the one worklet file is typechecked separately against those types rather than the DOM ones.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["@types/audioworklet"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/audio/sink.worklet.ts"]
+}
