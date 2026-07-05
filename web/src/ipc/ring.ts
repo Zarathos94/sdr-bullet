@@ -147,3 +147,147 @@ export class RingProducer {
     Atomics.notify(this.header, Slot.Write)
   }
 
+  get buffer(): SharedArrayBuffer {
+    return this.sab
+  }
+}
+
+/** The reading end of a ring. Exactly one worker may hold this. */
+export class RingConsumer {
+  private readonly header: Int32Array
+  private readonly data: Float32Array
+  private readonly capacity: number
+  private readonly mask: number
+
+  constructor(sab: SharedArrayBuffer) {
+    const v = views(sab)
+    this.header = v.header
+    this.data = v.data
+    this.capacity = v.capacity
+    this.mask = v.mask
+  }
+
+  /** Samples ready to read. */
+  available(): number {
+    // Acquire: pairs with the producer's release store.
+    const write = Atomics.load(this.header, Slot.Write)
+    const read = Atomics.load(this.header, Slot.Read)
+    return distance(write, read)
+  }
+
+  /**
+   * Reads up to `out.length` samples, returning how many were taken.
+   *
+   * Never blocks. A consumer that must not stall — an audio callback, most of all — calls
+   * this and accepts a short read.
+   */
+  read(out: Float32Array): number {
+    const read = Atomics.load(this.header, Slot.Read)
+    const write = Atomics.load(this.header, Slot.Write)
+    const count = Math.min(distance(write, read), out.length)
+    if (count === 0) return 0
+
+    const start = read & this.mask
+    const firstRun = Math.min(count, this.capacity - start)
+    out.set(this.data.subarray(start, start + firstRun), 0)
+    if (firstRun < count) {
+      out.set(this.data.subarray(0, count - firstRun), firstRun)
+    }
+
+    Atomics.store(this.header, Slot.Read, (read + count) >>> 0)
+    return count
+  }
+
+  /**
+   * Blocks until at least `wanted` samples are ready, the ring closes, or the timeout
+   * expires. Returns whether the samples arrived.
+   *
+   * **Only callable from a dedicated worker.** Worklet and window agents are specified
+   * with `[[CanBlock]] = false`, so `Atomics.wait` throws a `TypeError` there rather than
+   * waiting — which is correct, since blocking an audio render thread is exactly the
+   * failure this whole design exists to avoid.
+   */
+  waitFor(wanted: number, timeoutMs = 100): boolean {
+    for (;;) {
+      if (this.available() >= wanted) return true
+      if (Atomics.load(this.header, Slot.Closed) === 1) return false
+
+      // Re-read the index inside the wait so a value published between the check above
+      // and the wait below is not missed — `Atomics.wait` returns immediately when the
+      // observed value has already moved on.
+      const observed = Atomics.load(this.header, Slot.Write)
+      if (distance(observed, Atomics.load(this.header, Slot.Read)) >= wanted) return true
+
+      const result = Atomics.wait(this.header, Slot.Write, observed, timeoutMs)
+      if (result === 'timed-out') return this.available() >= wanted
+    }
+  }
+
+  /** Discards everything buffered. Used after retuning, when the old samples are stale. */
+  clear(): void {
+    Atomics.store(this.header, Slot.Read, Atomics.load(this.header, Slot.Write))
+  }
+
+  /** How full the ring is, from 0 to 1. Surfaced as a pipeline health indicator. */
+  fill(): number {
+    return this.available() / this.capacity
+  }
+}
+
+/**
+ * A single slot holding only the most recent frame.
+ *
+ * The right structure when a late frame is worthless rather than merely delayed. A
+ * spectrum display wants whatever arrived most recently; queueing frames it will never
+ * draw only adds latency, and back-pressure from a slow display must not reach the capture
+ * stage. Audio uses a real queue for the opposite reason — there, every sample matters.
+ *
+ * Double-buffered with a sequence counter, so a reader can tell whether the frame it just
+ * copied was overwritten while it was copying.
+ */
+export class LatestFrame {
+  private readonly header: Int32Array
+  private readonly slots: [Float32Array, Float32Array]
+
+  constructor(
+    private readonly sab: SharedArrayBuffer,
+    private readonly frameLength: number,
+  ) {
+    this.header = new Int32Array(sab, 0, HEADER_SLOTS)
+    const data = new Float32Array(sab, HEADER_BYTES)
+    this.slots = [
+      data.subarray(0, frameLength),
+      data.subarray(frameLength, frameLength * 2),
+    ]
+  }
+
+  static allocate(frameLength: number): SharedArrayBuffer {
+    return new SharedArrayBuffer(HEADER_BYTES + frameLength * 2 * 4)
+  }
+
+  /** Overwrites the pending frame. Never blocks and never fails. */
+  publish(frame: Float32Array): void {
+    const sequence = Atomics.load(this.header, Slot.Write)
+    // Write into whichever slot the reader is not currently looking at.
+    const target = this.slots[(sequence + 1) & 1]!
+    target.set(frame.subarray(0, this.frameLength))
+    Atomics.store(this.header, Slot.Write, (sequence + 1) >>> 0)
+  }
+
+  /**
+   * Copies the newest frame into `out`, returning false if none has been published since
+   * the last call.
+   */
+  consume(out: Float32Array): boolean {
+    const sequence = Atomics.load(this.header, Slot.Write)
+    if (sequence === Atomics.load(this.header, Slot.Read)) return false
+
+    out.set(this.slots[sequence & 1]!.subarray(0, Math.min(out.length, this.frameLength)))
+    Atomics.store(this.header, Slot.Read, sequence)
+    return true
+  }
+
+  get buffer(): SharedArrayBuffer {
+    return this.sab
+  }
+}
