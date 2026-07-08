@@ -127,3 +127,139 @@ export function describeClaimFailure(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/**
+ * An open device, ready for the driver to drive.
+ *
+ * Shaped to match the `Transport` trait on the Rust side so the two stay in step.
+ */
+export class UsbTransport {
+  private streaming = false
+  private queue: Promise<USBInTransferResult>[] = []
+
+  private constructor(
+    private readonly device: USBDevice,
+    readonly identity: DeviceIdentity,
+  ) {}
+
+  /** Opens the first already-permitted device. Safe to call from a worker. */
+  static async open(): Promise<UsbTransport> {
+    const devices = await grantedDevices()
+    const device = devices[0]
+    if (!device) {
+      throw new Error('no permitted device found — request access from the page first')
+    }
+
+    await device.open()
+    // Most devices are already in configuration 1, but selecting it is cheap and makes the
+    // starting state explicit rather than inherited.
+    if (device.configuration === null) {
+      await device.selectConfiguration(1)
+    }
+
+    try {
+      await device.claimInterface(INTERFACE)
+    } catch (error) {
+      await device.close().catch(() => {})
+      throw new Error(describeClaimFailure(error))
+    }
+
+    return new UsbTransport(device, identify(device))
+  }
+
+  /** Vendor control transfer, host to device. */
+  async controlOut(value: number, index: number, data: Uint8Array): Promise<void> {
+    // Copy into a fresh buffer: the source is usually a view into WebAssembly memory,
+    // which the transfer must not alias while it is in flight.
+    const payload = new Uint8Array(data.length)
+    payload.set(data)
+
+    const result = await this.device.controlTransferOut(
+      {
+        requestType: 'vendor',
+        recipient: 'device',
+        request: 0,
+        value,
+        index,
+      },
+      payload,
+    )
+    if (result.status !== 'ok') {
+      throw new Error(`control write to 0x${value.toString(16)} failed: ${result.status}`)
+    }
+  }
+
+  /** Vendor control transfer, device to host. */
+  async controlIn(value: number, index: number, length: number): Promise<Uint8Array> {
+    const result = await this.device.controlTransferIn(
+      {
+        requestType: 'vendor',
+        recipient: 'device',
+        request: 0,
+        value,
+        index,
+      },
+      length,
+    )
+    if (result.status !== 'ok' || !result.data) {
+      throw new Error(`control read from 0x${value.toString(16)} failed: ${result.status}`)
+    }
+    return new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength)
+  }
+
+  /** Begins the sample stream, filling the transfer queue. */
+  startStream(): void {
+    if (this.streaming) return
+    this.streaming = true
+    this.queue = []
+    for (let k = 0; k < TRANSFERS_IN_FLIGHT; k++) {
+      this.queue.push(this.device.transferIn(ENDPOINT, TRANSFER_BYTES))
+    }
+  }
+
+  /**
+   * Takes the next completed transfer and immediately submits a replacement.
+   *
+   * Resubmitting before returning is what keeps the queue depth constant; doing it after
+   * the caller has processed the block would leave a gap for exactly as long as processing
+   * takes.
+   */
+  async readSamples(): Promise<Uint8Array> {
+    if (!this.streaming) throw new Error('stream not started')
+
+    const pending = this.queue.shift()
+    if (!pending) throw new Error('transfer queue is empty')
+    this.queue.push(this.device.transferIn(ENDPOINT, TRANSFER_BYTES))
+
+    const result = await pending
+    if (result.status === 'stall') {
+      // Clearing the halt recovers the endpoint, but the data for this transfer is gone.
+      // Reporting that honestly matters: returning silent zeroes here — which is what the
+      // established JavaScript implementations do — turns a recoverable fault into an
+      // unexplained gap in the audio.
+      await this.device.clearHalt('in', ENDPOINT)
+      throw new Error('sample endpoint stalled')
+    }
+    if (result.status !== 'ok' || !result.data) {
+      throw new Error(`sample transfer failed: ${result.status}`)
+    }
+    return new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength)
+  }
+
+  async stopStream(): Promise<void> {
+    this.streaming = false
+    // Let the outstanding transfers settle rather than tearing the endpoint down beneath
+    // them, which surfaces as spurious errors on the next open.
+    await Promise.allSettled(this.queue)
+    this.queue = []
+  }
+
+  async close(): Promise<void> {
+    await this.stopStream()
+    try {
+      await this.device.releaseInterface(INTERFACE)
+    } catch {
+      // Already released, or the device is gone. Nothing useful to do either way.
+    }
+    await this.device.close().catch(() => {})
+  }
+}
