@@ -81,3 +81,84 @@ async function start(config: CaptureConfig) {
     const i = floatView(memory, stage.i_ptr(), samples)
     const q = floatView(memory, stage.q_ptr(), samples)
 
+    iq.write(i, q)
+
+    // The display only ever draws the newest frame, so a single overwritten slot is both
+    // cheaper than a queue and stops a slow display applying back pressure to capture. The
+    // spectrum worker and the main-thread constellation each read their own slot.
+    if (samples >= spectrumSamples) {
+      for (let k = 0; k < spectrumSamples; k++) {
+        spectrumFrame[k * 2] = i[k]!
+        spectrumFrame[k * 2 + 1] = q[k]!
+      }
+      spectrum.publish(spectrumFrame)
+      constellation.publish(spectrumFrame)
+    }
+
+    bytesSinceReport += usable
+    const now = performance.now()
+    if (now - lastReport > 500) {
+      const elapsed = (now - lastReport) / 1000
+      post({
+        type: 'status',
+        tunedHz: receiver.tunedHz,
+        sampleRate: actualRate,
+        band: receiver.band,
+        tunerFrequencyHz: receiver.tunerFrequencyHz,
+        locked: await receiver.isLocked(),
+        dropped: iq.dropped(),
+        bytesPerSecond: bytesSinceReport / elapsed,
+      })
+      bytesSinceReport = 0
+      lastReport = now
+    }
+  }
+
+  iq.close()
+  await teardown()
+}
+
+async function teardown() {
+  running = false
+  if (transport) {
+    await transport.close().catch(() => {})
+    transport = undefined
+  }
+  receiver = undefined
+}
+
+self.onmessage = async (event: MessageEvent<ToCapture>) => {
+  const message = event.data
+  try {
+    switch (message.type) {
+      case 'start':
+        await start(message.config)
+        break
+      case 'tune':
+        if (receiver) {
+          await receiver.setFrequency(message.hz)
+          // Whatever is already in flight was captured at the previous frequency.
+          await receiver.resetBuffer()
+        }
+        break
+      case 'gain':
+        await receiver?.setGain(message.tenths)
+        break
+      case 'biasTee':
+        await receiver?.setBiasTee(message.enabled)
+        break
+      case 'correction':
+        await receiver?.setFrequencyCorrection(message.ppm)
+        break
+      case 'stop':
+        await teardown()
+        break
+    }
+  } catch (error) {
+    post({
+      type: 'error',
+      message: error instanceof Error ? error.message : String(error),
+      fatal: true,
+    })
+  }
+}
