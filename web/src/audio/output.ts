@@ -46,3 +46,58 @@ export class AudioOutput {
       processorOptions: { ring },
     })
 
+    this.node.onprocessorerror = () => {
+      // The specification permanently disables a processor that throws, so there is no
+      // recovering this node — only rebuilding it.
+      this.node = undefined
+    }
+    this.node.port.onmessage = (event) => {
+      this.health = event.data as AudioHealth
+    }
+
+    this.gain = this.context.createGain()
+    this.node.connect(this.gain)
+    this.gain.connect(this.context.destination)
+
+    // Autoplay policy leaves a context suspended until a gesture resumes it.
+    if (this.context.state === 'suspended') {
+      await this.context.resume()
+    }
+  }
+
+  setVolume(value: number): void {
+    if (!this.gain || !this.context) return
+    // Ramp rather than assign: a step change in gain is a click.
+    this.gain.gain.setTargetAtTime(
+      Math.max(0, Math.min(1, value)),
+      this.context.currentTime,
+      0.02,
+    )
+  }
+
+  /** Round-trip latency in seconds, as far as the browser will report it. */
+  latency(): number {
+    if (!this.context) return 0
+    // `outputLatency` is the honest figure but reached Safari only recently, so fall back
+    // to the part every browser reports.
+    return this.context.outputLatency || this.context.baseLatency || 0
+  }
+
+  status(): AudioHealth {
+    return this.health
+  }
+
+  get sampleRate(): number {
+    return this.context?.sampleRate ?? 0
+  }
+
+  async stop(): Promise<void> {
+    this.node?.port.postMessage('stop')
+    this.node?.disconnect()
+    this.gain?.disconnect()
+    await this.context?.close().catch(() => {})
+    this.context = undefined
+    this.node = undefined
+    this.gain = undefined
+  }
+}
