@@ -186,3 +186,183 @@ export class WaterfallRenderer {
   private colourBind: GPUBindGroup | undefined
   private drawBind: GPUBindGroup | undefined
 
+  private binCount = 0
+  private rowCount = 0
+  /** Next row the ring will be written to; the newest row is `cursor - 1`. */
+  private cursor = 0
+  /**
+   * Rows written since the last (re)allocation, capped at the ring height. Before the ring has
+   * filled, the written rows are exactly [0, cursor); the auto-range reduction reads only those
+   * so the prefilled floor does not peg the computed minimum until real rows have replaced it.
+   */
+  private rowsPushed = 0
+
+  private manualMin = -100
+  private manualMax = -20
+  private autoRange = true
+  private smMin = 0
+  private smMax = 0
+  private rangeReady = false
+  /** True while a range readback is mapped; a fresh copy must not be encoded until it clears. */
+  private rangePending = false
+
+  constructor(
+    private readonly device: GPUDevice,
+    private readonly canvas: HTMLCanvasElement,
+  ) {
+    const context = canvas.getContext('webgpu')
+    if (!context) throw new Error('WaterfallRenderer: could not get a webgpu canvas context')
+    this.context = context
+    this.format = navigator.gpu.getPreferredCanvasFormat()
+    // Opaque: the waterfall fills every pixel it owns, so there is nothing to blend with.
+    context.configure({ device, format: this.format, alphaMode: 'opaque' })
+
+    const reduceModule = device.createShaderModule({ code: REDUCE_WGSL })
+    const colourModule = device.createShaderModule({ code: COLOUR_WGSL })
+    const drawModule = device.createShaderModule({ code: DRAW_WGSL })
+
+    // The ring is an r32float storage texture, read-only in the shaders: writeTexture fills it a
+    // row at a time (its COPY_DST usage) and the passes only ever textureLoad it. r32float storage
+    // is core, so nothing here needs a requiredFeatures entry.
+    const ringEntry: GPUBindGroupLayoutEntry = {
+      binding: 0,
+      visibility: GPUShaderStage.COMPUTE,
+      storageTexture: { access: 'read-only', format: 'r32float', viewDimension: '2d' },
+    }
+    this.reduceLayout = device.createBindGroupLayout({
+      entries: [
+        ringEntry,
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    })
+    this.colourLayout = device.createBindGroupLayout({
+      entries: [
+        ringEntry,
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        {
+          binding: 4,
+          visibility: GPUShaderStage.COMPUTE,
+          storageTexture: { access: 'write-only', format: 'rgba8unorm' },
+        },
+      ],
+    })
+
+    this.reducePipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.reduceLayout] }),
+      compute: { module: reduceModule, entryPoint: 'main' },
+    })
+    this.colourPipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.colourLayout] }),
+      compute: { module: colourModule, entryPoint: 'main' },
+    })
+    // The draw pass samples only the rgba8unorm colour ring, which is filterable, so an auto
+    // layout infers a compatible 'float' binding without help.
+    this.drawPipeline = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: drawModule, entryPoint: 'vs' },
+      fragment: { module: drawModule, entryPoint: 'fs', targets: [{ format: this.format }] },
+      primitive: { topology: 'triangle-list' },
+    })
+
+    this.lutSampler = device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+    })
+    this.lutTex = device.createTexture({
+      size: { width: 256, height: 1 },
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+    this.setColormap('viridis')
+
+    this.paramsBuf = device.createBuffer({
+      size: this.paramsData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.reduceBuf = device.createBuffer({
+      size: this.reduceData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.minmaxBuf = device.createBuffer({
+      size: 8,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    })
+    this.stagingBuf = device.createBuffer({
+      size: 8,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    })
+
+    // Adopt whatever size the canvas already has; a later resize() re-sizes cleanly.
+    if (canvas.width > 0 && canvas.height > 0) {
+      this.rowCount = Math.min(canvas.height, device.limits.maxTextureDimension2D)
+    }
+  }
+
+  /** Replaces the colour scale. Takes effect on the next frame; history recolours with it. */
+  setColormap(name: ColormapName): void {
+    this.device.queue.writeTexture(
+      { texture: this.lutTex },
+      // Freshly allocated, so plain-backed; the cast states that for TypeScript 5.7's
+      // buffer-generic array types, which the GPU queue's non-shared requirement needs.
+      colormapTexels(name) as Uint8Array<ArrayBuffer>,
+      { bytesPerRow: 256 * 4, rowsPerImage: 1 },
+      { width: 256, height: 1, depthOrArrayLayers: 1 },
+    )
+  }
+
+  /** Fixes the dB window used when auto-range is off. */
+  setRange(minDb: number, maxDb: number): void {
+    this.manualMin = minDb
+    this.manualMax = maxDb
+  }
+
+  /** Turns the reduction-driven auto-range on or off. When off, {@link setRange} governs. */
+  setAutoRange(enabled: boolean): void {
+    this.autoRange = enabled
+  }
+
+  /**
+   * Sizes the backing store. `width`/`height` arrive as physical device pixels — the caller
+   * has already multiplied the CSS box by `devicePixelRatio`, which is what makes the surface
+   * sharp on a hi-dpi display instead of upscaled. History depth follows the panel height, one
+   * texture row per screen row, so a resize restarts the history; for a live display that is a
+   * fair trade against carrying stale rows at the wrong scale.
+   */
+  resize(width: number, height: number): void {
+    const max = this.device.limits.maxTextureDimension2D
+    const w = Math.max(1, Math.min(Math.round(width), max))
+    const h = Math.max(1, Math.min(Math.round(height), max))
+    if (this.canvas.width !== w) this.canvas.width = w
+    if (this.canvas.height !== h) this.canvas.height = h
+    if (h !== this.rowCount) {
+      this.rowCount = h
+      if (this.binCount > 0) this.allocate()
+    }
+  }
+
+  /** Appends one spectrum row, dB values in display order (lowest frequency first). */
+  pushRow(bins: Float32Array): void {
+    if (bins.length === 0) return
+    if (bins.length !== this.binCount) {
+      this.binCount = bins.length
+      if (this.rowCount > 0) this.allocate()
+    }
+    if (!this.ringTex || this.rowCount === 0) return
+
+    this.device.queue.writeTexture(
+      { texture: this.ringTex, origin: { x: 0, y: this.cursor, z: 0 } },
+      // The spectrum frame from the pipeline is a plain array, not a view over the shared
+      // ring; the cast records the non-shared backing the GPU queue requires.
+      bins as Float32Array<ArrayBuffer>,
+      { bytesPerRow: this.binCount * 4, rowsPerImage: 1 },
+      { width: this.binCount, height: 1, depthOrArrayLayers: 1 },
+    )
+    this.cursor = (this.cursor + 1) % this.rowCount
+    if (this.rowsPushed < this.rowCount) this.rowsPushed++
+  }
+
