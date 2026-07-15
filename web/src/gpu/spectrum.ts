@@ -127,3 +127,132 @@ export class SpectrumRenderer {
       primitive: { topology: 'line-strip' },
     })
 
+    this.dataBuf = device.createBuffer({
+      size: MAX_BINS * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    this.paramsBuf = device.createBuffer({
+      size: this.paramsData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+
+    this.fillBind = device.createBindGroup({
+      layout: this.fillPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.dataBuf } },
+        { binding: 1, resource: { buffer: this.paramsBuf } },
+      ],
+    })
+    this.lineBind = device.createBindGroup({
+      layout: this.linePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.dataBuf } },
+        { binding: 1, resource: { buffer: this.paramsBuf } },
+      ],
+    })
+  }
+
+  /** Fixes the dB window the trace is scaled to. */
+  setRange(minDb: number, maxDb: number): void {
+    this.minDb = minDb
+    this.maxDb = maxDb
+  }
+
+  /** Shows or hides the filled area under the trace. */
+  setFilled(enabled: boolean): void {
+    this.filled = enabled
+  }
+
+  /** Overrides the theme-derived colours, e.g. after a light/dark switch. */
+  setColours(
+    trace: [number, number, number],
+    area: [number, number, number],
+    background: [number, number, number],
+  ): void {
+    this.trace = trace
+    this.area = area
+    this.background = background
+  }
+
+  /** Replaces the trace with a new spectrum, dB values in display order (lowest frequency first). */
+  pushRow(bins: Float32Array): void {
+    if (bins.length === 0) return
+    this.binCount = Math.min(bins.length, MAX_BINS)
+    // The cast asserts a non-shared backing buffer, which the GPU queue requires and which
+    // the pipeline satisfies — the spectrum frame is a plain array, never a view over the
+    // shared ring. TypeScript 5.7 tracks the backing-buffer kind in the element type, so
+    // this makes the runtime contract explicit rather than papering over a real hazard.
+    this.device.queue.writeBuffer(
+      this.dataBuf,
+      0,
+      bins.subarray(0, this.binCount) as Float32Array<ArrayBuffer>,
+    )
+  }
+
+  /**
+   * Sizes the backing store. `width`/`height` are physical device pixels — already scaled by
+   * `devicePixelRatio` — so the trace stays a single crisp pixel wide on hi-dpi displays.
+   */
+  resize(width: number, height: number): void {
+    const max = this.device.limits.maxTextureDimension2D
+    const w = Math.max(1, Math.min(Math.round(width), max))
+    const h = Math.max(1, Math.min(Math.round(height), max))
+    if (this.canvas.width !== w) this.canvas.width = w
+    if (this.canvas.height !== h) this.canvas.height = h
+  }
+
+  render(): void {
+    // A strip needs at least two bins to form a segment; below that there is nothing to draw.
+    if (this.binCount < 2) return
+    this.writeParams()
+
+    const enc = this.device.createCommandEncoder()
+    const view = this.context.getCurrentTexture().createView()
+    const [br, bg, bb] = this.background
+    const pass = enc.beginRenderPass({
+      colorAttachments: [
+        {
+          view,
+          loadOp: 'clear',
+          storeOp: 'store',
+          clearValue: { r: br, g: bg, b: bb, a: 1 },
+        },
+      ],
+    })
+
+    if (this.filled) {
+      pass.setPipeline(this.fillPipeline)
+      pass.setBindGroup(0, this.fillBind)
+      pass.draw(this.binCount * 2)
+    }
+    pass.setPipeline(this.linePipeline)
+    pass.setBindGroup(0, this.lineBind)
+    pass.draw(this.binCount)
+    pass.end()
+
+    this.device.queue.submit([enc.finish()])
+  }
+
+  dispose(): void {
+    this.dataBuf.destroy()
+    this.paramsBuf.destroy()
+  }
+
+  private writeParams(): void {
+    const v = this.paramsView
+    v.setFloat32(0, this.minDb, true)
+    v.setFloat32(4, this.maxDb, true)
+    v.setUint32(8, this.binCount >>> 0, true)
+    const [tr, tg, tb] = this.trace
+    v.setFloat32(16, tr, true)
+    v.setFloat32(20, tg, true)
+    v.setFloat32(24, tb, true)
+    v.setFloat32(28, 1, true)
+    const [ar, ag, ab] = this.area
+    v.setFloat32(32, ar, true)
+    v.setFloat32(36, ag, true)
+    v.setFloat32(40, ab, true)
+    v.setFloat32(44, AREA_ALPHA, true)
+    this.device.queue.writeBuffer(this.paramsBuf, 0, this.paramsData)
+  }
+}
