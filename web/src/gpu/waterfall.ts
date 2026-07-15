@@ -366,3 +366,190 @@ export class WaterfallRenderer {
     if (this.rowsPushed < this.rowCount) this.rowsPushed++
   }
 
+  render(): void {
+    if (
+      !this.ringTex ||
+      !this.colourTex ||
+      !this.colourBind ||
+      !this.drawBind ||
+      !this.reduceBind ||
+      this.binCount === 0 ||
+      this.rowCount === 0
+    ) {
+      return
+    }
+
+    let minDb = this.manualMin
+    let maxDb = this.manualMax
+    if (this.autoRange && this.rangeReady) {
+      minDb = this.smMin
+      maxDb = this.smMax
+    }
+    if (maxDb <= minDb) maxDb = minDb + 1
+    this.writeParams(minDb, maxDb)
+
+    const enc = this.device.createCommandEncoder()
+
+    let doMap = false
+    // Only reduce once there is real data; reducing an empty ring would report the sentinels.
+    if (this.autoRange && this.rowsPushed > 0) {
+      this.writeReduceParams()
+      const pass = enc.beginComputePass()
+      pass.setPipeline(this.reducePipeline)
+      pass.setBindGroup(0, this.reduceBind)
+      pass.dispatchWorkgroups(1, 1, 1)
+      pass.end()
+      // Only stage a readback when the previous one has been consumed; a mapped buffer cannot
+      // be a copy target. Frames between readbacks reuse the last smoothed range.
+      if (!this.rangePending) {
+        enc.copyBufferToBuffer(this.minmaxBuf, 0, this.stagingBuf, 0, 8)
+        doMap = true
+      }
+    }
+
+    const colour = enc.beginComputePass()
+    colour.setPipeline(this.colourPipeline)
+    colour.setBindGroup(0, this.colourBind)
+    colour.dispatchWorkgroups(
+      Math.ceil(this.binCount / TILE),
+      Math.ceil(this.rowCount / TILE),
+      1,
+    )
+    colour.end()
+
+    const view = this.context.getCurrentTexture().createView()
+    const draw = enc.beginRenderPass({
+      colorAttachments: [
+        { view, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
+      ],
+    })
+    draw.setPipeline(this.drawPipeline)
+    draw.setBindGroup(0, this.drawBind)
+    draw.draw(3)
+    draw.end()
+
+    this.device.queue.submit([enc.finish()])
+
+    if (doMap) {
+      this.rangePending = true
+      void this.stagingBuf
+        .mapAsync(GPUMapMode.READ)
+        .then(() => {
+          const arr = new Float32Array(this.stagingBuf.getMappedRange())
+          const mn = arr[0] ?? Number.NaN
+          const mx = arr[1] ?? Number.NaN
+          this.stagingBuf.unmap()
+          this.absorbRange(mn, mx)
+          this.rangePending = false
+        })
+        .catch(() => {
+          this.rangePending = false
+        })
+    }
+  }
+
+  dispose(): void {
+    this.ringTex?.destroy()
+    this.colourTex?.destroy()
+    this.lutTex.destroy()
+    this.paramsBuf.destroy()
+    this.reduceBuf.destroy()
+    this.minmaxBuf.destroy()
+    this.stagingBuf.destroy()
+    this.ringTex = undefined
+    this.colourTex = undefined
+    this.reduceBind = undefined
+    this.colourBind = undefined
+    this.drawBind = undefined
+  }
+
+  private absorbRange(mn: number, mx: number): void {
+    if (!Number.isFinite(mn) || !Number.isFinite(mx)) return
+    if (!this.rangeReady) {
+      this.smMin = mn
+      this.smMax = mx
+      this.rangeReady = true
+      return
+    }
+    this.smMin += (mn - this.smMin) * SMOOTH_RATE
+    this.smMax += (mx - this.smMax) * SMOOTH_RATE
+  }
+
+  private writeParams(minDb: number, maxDb: number): void {
+    const v = this.paramsView
+    v.setFloat32(0, minDb, true)
+    v.setFloat32(4, maxDb, true)
+    v.setUint32(8, this.cursor >>> 0, true)
+    v.setUint32(12, this.binCount >>> 0, true)
+    v.setUint32(16, this.rowCount >>> 0, true)
+    this.device.queue.writeBuffer(this.paramsBuf, 0, this.paramsData)
+  }
+
+  private writeReduceParams(): void {
+    const v = this.reduceView
+    // Only the rows written so far, which are contiguous at [0, rowsPushed) until the ring wraps
+    // and rowsPushed saturates at the full height.
+    v.setUint32(0, (this.binCount * this.rowsPushed) >>> 0, true)
+    v.setUint32(4, this.binCount >>> 0, true)
+    this.device.queue.writeBuffer(this.reduceBuf, 0, this.reduceData)
+  }
+
+  /** (Re)allocates the size-dependent textures and their bind groups, and clears the history. */
+  private allocate(): void {
+    this.ringTex?.destroy()
+    this.colourTex?.destroy()
+
+    const size = { width: this.binCount, height: this.rowCount }
+    this.ringTex = this.device.createTexture({
+      size,
+      format: 'r32float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+    this.colourTex = this.device.createTexture({
+      size,
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    })
+
+    // Prime the ring with the floor value so unfilled history renders as the colormap's low
+    // end rather than the zero a fresh texture would otherwise show as a bright band.
+    const fill = new Float32Array(this.binCount * this.rowCount).fill(this.manualMin)
+    this.device.queue.writeTexture(
+      { texture: this.ringTex },
+      fill,
+      { bytesPerRow: this.binCount * 4, rowsPerImage: this.rowCount },
+      { width: this.binCount, height: this.rowCount, depthOrArrayLayers: 1 },
+    )
+    this.cursor = 0
+    this.rowsPushed = 0
+
+    const ringView = this.ringTex.createView()
+    const colourView = this.colourTex.createView()
+
+    this.reduceBind = this.device.createBindGroup({
+      layout: this.reduceLayout,
+      entries: [
+        { binding: 0, resource: ringView },
+        { binding: 1, resource: { buffer: this.reduceBuf } },
+        { binding: 2, resource: { buffer: this.minmaxBuf } },
+      ],
+    })
+    this.colourBind = this.device.createBindGroup({
+      layout: this.colourLayout,
+      entries: [
+        { binding: 0, resource: ringView },
+        { binding: 1, resource: this.lutTex.createView() },
+        { binding: 2, resource: this.lutSampler },
+        { binding: 3, resource: { buffer: this.paramsBuf } },
+        { binding: 4, resource: colourView },
+      ],
+    })
+    this.drawBind = this.device.createBindGroup({
+      layout: this.drawPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: colourView },
+        { binding: 1, resource: { buffer: this.paramsBuf } },
+      ],
+    })
+  }
+}
