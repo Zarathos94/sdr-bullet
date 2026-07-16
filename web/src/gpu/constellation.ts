@@ -207,3 +207,201 @@ export class ConstellationRenderer {
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     })
 
+    this.lutSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' })
+    this.densitySampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' })
+    this.lutTex = device.createTexture({
+      size: { width: 256, height: 1 },
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+
+    this.splatBuf = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.decayBuf = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.colourBuf = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+
+    const density = this.densityTex.createView()
+    this.splatBind = device.createBindGroup({
+      layout: this.splatPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.accumBuf } },
+        { binding: 1, resource: { buffer: this.iBuf } },
+        { binding: 2, resource: { buffer: this.qBuf } },
+        { binding: 3, resource: { buffer: this.splatBuf } },
+      ],
+    })
+    this.decayBind = device.createBindGroup({
+      layout: this.decayPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.accumBuf } },
+        { binding: 1, resource: { buffer: this.decayBuf } },
+      ],
+    })
+    this.colourBind = device.createBindGroup({
+      layout: this.colourPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.accumBuf } },
+        { binding: 1, resource: this.lutTex.createView() },
+        { binding: 2, resource: this.lutSampler },
+        { binding: 3, resource: { buffer: this.colourBuf } },
+        { binding: 4, resource: density },
+      ],
+    })
+    this.drawBind = device.createBindGroup({
+      layout: this.drawPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: density },
+        { binding: 1, resource: this.densitySampler },
+      ],
+    })
+
+    // The colour-pass geometry never changes, so its uniform is written once.
+    this.writeColourParams()
+    this.setColormap('inferno')
+  }
+
+  /** Replaces the density colour scale. */
+  setColormap(name: ColormapName): void {
+    this.device.queue.writeTexture(
+      { texture: this.lutTex },
+      // Freshly allocated by colormapTexels, so its backing buffer is a plain ArrayBuffer;
+      // the cast tells TypeScript 5.7's buffer-generic types what is already true.
+      colormapTexels(name) as Uint8Array<ArrayBuffer>,
+      { bytesPerRow: 256 * 4, rowsPerImage: 1 },
+      { width: 256, height: 1, depthOrArrayLayers: 1 },
+    )
+  }
+
+  /**
+   * Trail persistence: the fraction of density carried from one frame to the next. 0 clears
+   * every frame (no trail); values approaching 1 hold trails for many frames. Clamped below 1
+   * so decay always terminates.
+   */
+  setPersistence(alpha: number): void {
+    this.alpha = Math.max(0, Math.min(alpha, 0.9999))
+  }
+
+  /**
+   * Scatters one block of I/Q samples into the density grid. Amplitudes are expected roughly in
+   * [-1, 1]; anything off the grid is dropped. Blocks longer than the sample cap are uploaded
+   * and dispatched in chunks so a large batch never overflows the buffers.
+   */
+  pushSamples(i: Float32Array, q: Float32Array): void {
+    const total = Math.min(i.length, q.length)
+    for (let off = 0; off < total; off += MAX_SAMPLES) {
+      const len = Math.min(MAX_SAMPLES, total - off)
+      // The render loop hands over plain deinterleaved arrays, never views over the shared
+      // ring, so a non-shared backing buffer is guaranteed. The GPU queue cannot read a
+      // shared buffer, and the cast records that requirement for the type checker.
+      this.device.queue.writeBuffer(
+        this.iBuf,
+        0,
+        i.subarray(off, off + len) as Float32Array<ArrayBuffer>,
+      )
+      this.device.queue.writeBuffer(
+        this.qBuf,
+        0,
+        q.subarray(off, off + len) as Float32Array<ArrayBuffer>,
+      )
+      this.writeSplatParams(len)
+
+      const enc = this.device.createCommandEncoder()
+      const pass = enc.beginComputePass()
+      pass.setPipeline(this.splatPipeline)
+      pass.setBindGroup(0, this.splatBind)
+      pass.dispatchWorkgroups(Math.ceil(len / 256), 1, 1)
+      pass.end()
+      this.device.queue.submit([enc.finish()])
+    }
+  }
+
+  render(): void {
+    this.writeDecayParams()
+
+    const enc = this.device.createCommandEncoder()
+
+    // Fade first, so density scattered during this frame is at full weight and only starts
+    // fading on the next one.
+    const decay = enc.beginComputePass()
+    decay.setPipeline(this.decayPipeline)
+    decay.setBindGroup(0, this.decayBind)
+    decay.dispatchWorkgroups(Math.ceil(CELLS / 256), 1, 1)
+    decay.end()
+
+    const colour = enc.beginComputePass()
+    colour.setPipeline(this.colourPipeline)
+    colour.setBindGroup(0, this.colourBind)
+    colour.dispatchWorkgroups(Math.ceil(GRID / TILE), Math.ceil(GRID / TILE), 1)
+    colour.end()
+
+    const view = this.context.getCurrentTexture().createView()
+    const draw = enc.beginRenderPass({
+      colorAttachments: [
+        { view, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
+      ],
+    })
+    draw.setPipeline(this.drawPipeline)
+    draw.setBindGroup(0, this.drawBind)
+    draw.draw(3)
+    draw.end()
+
+    this.device.queue.submit([enc.finish()])
+  }
+
+  /**
+   * Sizes the backing store. `width`/`height` are physical device pixels (already scaled by
+   * `devicePixelRatio` by the caller), which keeps the plot crisp on hi-dpi displays. The
+   * density grid is independent of the canvas, so only the presentation surface changes here.
+   */
+  resize(width: number, height: number): void {
+    const max = this.device.limits.maxTextureDimension2D
+    const w = Math.max(1, Math.min(Math.round(width), max))
+    const h = Math.max(1, Math.min(Math.round(height), max))
+    if (this.canvas.width !== w) this.canvas.width = w
+    if (this.canvas.height !== h) this.canvas.height = h
+  }
+
+  dispose(): void {
+    this.accumBuf.destroy()
+    this.iBuf.destroy()
+    this.qBuf.destroy()
+    this.densityTex.destroy()
+    this.lutTex.destroy()
+    this.splatBuf.destroy()
+    this.decayBuf.destroy()
+    this.colourBuf.destroy()
+  }
+
+  private writeSplatParams(count: number): void {
+    const v = this.splatView
+    v.setUint32(0, count >>> 0, true)
+    v.setUint32(4, GRID, true)
+    v.setUint32(8, GRID, true)
+    v.setFloat32(12, this.scale, true)
+    this.device.queue.writeBuffer(this.splatBuf, 0, this.splatData)
+  }
+
+  private writeDecayParams(): void {
+    const v = this.decayView
+    v.setFloat32(0, this.alpha, true)
+    v.setUint32(4, CELLS, true)
+    this.device.queue.writeBuffer(this.decayBuf, 0, this.decayData)
+  }
+
+  private writeColourParams(): void {
+    const data = new ArrayBuffer(16)
+    const v = new DataView(data)
+    v.setUint32(0, GRID, true)
+    v.setUint32(4, GRID, true)
+    v.setFloat32(8, this.logCap, true)
+    this.device.queue.writeBuffer(this.colourBuf, 0, data)
+  }
+}
