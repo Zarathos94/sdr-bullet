@@ -164,3 +164,154 @@ export class Pipeline {
       },
     })
 
+    this.capture = new Worker(new URL('./workers/capture.worker.ts', import.meta.url), {
+      type: 'module',
+    })
+    this.capture.onmessage = (event) => this.handle(event.data as FromWorker, 'capture')
+    this.post<ToCapture>(this.capture, {
+      type: 'start',
+      config: {
+        iq,
+        spectrum: spectrumSource,
+        constellation: constellationSource,
+        spectrumFrameLength: FFT_SIZE * 2,
+        sampleRate: CAPTURE_RATE,
+        centreHz,
+        gainTenths,
+        isV4: this.device?.isV4 ?? false,
+      },
+    })
+
+    this.running = true
+  }
+
+  private post<T>(worker: Worker, message: T): void {
+    worker.postMessage(message)
+  }
+
+  private handle(message: FromWorker, source: 'capture' | 'dsp'): void {
+    switch (message.type) {
+      case 'ready':
+        this.simdBackend = message.simdBackend
+        break
+      case 'error':
+        this.errorListener?.(message.message, message.fatal)
+        if (message.fatal) void this.stop()
+        break
+      case 'status':
+        if (source === 'capture') this.captureStatus = message as CaptureStatus
+        else this.dspStatus = message as DspStatus
+        break
+    }
+    this.statusListener?.(this.status())
+  }
+
+  /** Copies the newest spectrum row, or returns null if none has arrived since last call. */
+  latestSpectrum(): Float32Array | null {
+    if (!this.spectrumSink) return null
+    return this.spectrumSink.consume(this.bins) ? this.bins : null
+  }
+
+  /**
+   * The newest baseband frame as interleaved I/Q, or null if none is new.
+   *
+   * Feeds the constellation. This is the wideband capture rather than the demodulated
+   * channel — for a constant-envelope mode like FM it reads as a ring, which is the
+   * expected shape, and it avoids threading a second frame out of the DSP worker.
+   */
+  latestConstellation(): Float32Array | null {
+    if (!this.constellationSource) return null
+    return this.constellationSource.consume(this.constellationFrame)
+      ? this.constellationFrame
+      : null
+  }
+
+  tune(hz: number): void {
+    if (this.capture) this.post<ToCapture>(this.capture, { type: 'tune', hz })
+  }
+
+  /**
+   * Moves the wanted channel within the captured bandwidth, without retuning the hardware.
+   *
+   * Cheaper than a retune, and it leaves the display still while the channel marker moves.
+   */
+  setChannelOffset(hz: number): void {
+    if (this.dsp) this.post<ToDsp>(this.dsp, { type: 'offset', hz })
+  }
+
+  setGain(tenths: number): void {
+    if (this.capture) this.post<ToCapture>(this.capture, { type: 'gain', tenths })
+  }
+
+  setSquelch(enabled: boolean, threshold: number): void {
+    if (this.dsp) this.post<ToDsp>(this.dsp, { type: 'squelch', enabled, threshold })
+  }
+
+  setDeemphasis(microseconds: number): void {
+    if (this.dsp) this.post<ToDsp>(this.dsp, { type: 'deemphasis', microseconds })
+  }
+
+  setForcedMono(forced: boolean): void {
+    if (this.dsp) this.post<ToDsp>(this.dsp, { type: 'mono', forced })
+  }
+
+  setAgc(enabled: boolean): void {
+    if (this.dsp) this.post<ToDsp>(this.dsp, { type: 'agc', enabled })
+  }
+
+  setBiasTee(enabled: boolean): void {
+    if (this.capture) this.post<ToCapture>(this.capture, { type: 'biasTee', enabled })
+  }
+
+  setFrequencyCorrection(ppm: number): void {
+    if (this.capture) this.post<ToCapture>(this.capture, { type: 'correction', ppm })
+  }
+
+  setVolume(value: number): void {
+    this.audio.setVolume(value)
+  }
+
+  setSpectrumSmoothing(alpha: number): void {
+    if (this.spectrumWorker) {
+      this.post<ToSpectrum>(this.spectrumWorker, { type: 'smoothing', alpha })
+    }
+  }
+
+  status(): PipelineStatus {
+    return {
+      running: this.running,
+      device: this.device,
+      simdBackend: this.simdBackend,
+      capture: this.captureStatus,
+      dsp: this.dspStatus,
+      audio: this.audio.status(),
+      audioLatency: this.audio.latency(),
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.running = false
+
+    // Capture first, so the stages downstream drain rather than being cut off mid-block.
+    if (this.capture) this.post<ToCapture>(this.capture, { type: 'stop' })
+    if (this.dsp) this.post<ToDsp>(this.dsp, { type: 'stop' })
+    if (this.spectrumWorker) this.post<ToSpectrum>(this.spectrumWorker, { type: 'stop' })
+
+    await this.audio.stop()
+
+    // Give the workers a moment to close their devices before terminating them; a
+    // terminate mid-transfer leaves the interface claimed until the page is reloaded.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    this.capture?.terminate()
+    this.dsp?.terminate()
+    this.spectrumWorker?.terminate()
+    this.capture = undefined
+    this.dsp = undefined
+    this.spectrumWorker = undefined
+    this.spectrumSink = undefined
+    this.constellationSource = undefined
+    this.captureStatus = undefined
+    this.dspStatus = undefined
+  }
+}
