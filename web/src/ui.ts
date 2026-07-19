@@ -132,3 +132,137 @@ export class ReceiverUI {
     constellationWrap.append(el('div', 'canvas-label', 'Constellation'))
     displays.append(constellationWrap)
 
+    return displays
+  }
+
+  private buildControls(): HTMLElement {
+    const side = el('div', 'side')
+
+    // Frequency and tuning.
+    const tuning = el('div', 'panel')
+    tuning.append(el('h2', undefined, 'Tuning'))
+    tuning.append(this.frequencyDisplay)
+
+    const input = el('input')
+    input.type = 'text'
+    input.placeholder = 'e.g. 98.5M, 7100k, 145000000'
+    input.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return
+      const hz = parseFrequency(input.value)
+      if (hz !== null) this.setFrequency(hz)
+      input.value = ''
+    })
+    tuning.append(input)
+
+    const presetSelect = el('select')
+    presetSelect.append(el('option', undefined, 'Presets…'))
+    for (const [index, preset] of PRESETS.entries()) {
+      const option = el('option', undefined, preset.label)
+      option.value = String(index)
+      presetSelect.append(option)
+    }
+    presetSelect.addEventListener('change', () => {
+      const preset = PRESETS[Number(presetSelect.value)]
+      if (!preset) return
+      this.mode = preset.mode
+      this.setFrequency(preset.frequencyHz)
+      this.syncModeButtons()
+      if (preset.deemphasisUs) this.pipeline.setDeemphasis(preset.deemphasisUs)
+    })
+    tuning.append(presetSelect)
+    tuning.append(this.startButton)
+    side.append(tuning)
+
+    // Mode.
+    const modePanel = el('div', 'panel')
+    modePanel.append(el('h2', undefined, 'Mode'))
+    const modeGroup = el('div', 'mode-group')
+    for (const { name, label } of MODES) {
+      const button = el('button', undefined, label)
+      button.addEventListener('click', () => void this.setMode(name))
+      this.modeButtons.set(name, button)
+      modeGroup.append(button)
+    }
+    modePanel.append(modeGroup)
+    this.syncModeButtons()
+    side.append(modePanel)
+
+    side.append(this.buildAudioPanel())
+    side.append(this.buildRdsPanel())
+
+    const statusPanel = el('div', 'panel')
+    statusPanel.append(el('h2', undefined, 'Signal'))
+    statusPanel.append(this.stats)
+    side.append(statusPanel)
+
+    return side
+  }
+
+  private buildAudioPanel(): HTMLElement {
+    const panel = el('div', 'panel')
+    panel.append(el('h2', undefined, 'Audio'))
+
+    const volumeRow = el('div', 'control-row')
+    volumeRow.append(el('label', undefined, 'Volume'))
+    const volume = el('input')
+    volume.type = 'range'
+    volume.min = '0'
+    volume.max = '100'
+    volume.value = '70'
+    volume.addEventListener('input', () => {
+      this.pipeline.setVolume(Number(volume.value) / 100)
+    })
+    volumeRow.append(volume)
+    panel.append(volumeRow)
+
+    const gainRow = el('div', 'control-row')
+    gainRow.append(el('label', undefined, 'Tuner gain'))
+    const gain = el('select')
+    const autoOption = el('option', undefined, 'Automatic')
+    autoOption.value = '-1'
+    gain.append(autoOption)
+    // Whole-decibel steps are plenty for a control; the underlying table is finer.
+    for (let db = 0; db <= 49; db += 3) {
+      const option = el('option', undefined, `${db} dB`)
+      option.value = String(db * 10)
+      gain.append(option)
+    }
+    gain.addEventListener('change', () => this.pipeline.setGain(Number(gain.value)))
+    gainRow.append(gain)
+    panel.append(gainRow)
+
+    const squelchRow = el('div', 'control-row')
+    squelchRow.append(el('label', undefined, 'Squelch'))
+    const squelch = el('input')
+    squelch.type = 'checkbox'
+    squelch.addEventListener('change', () => {
+      this.pipeline.setSquelch(squelch.checked, 0.08)
+    })
+    squelchRow.append(squelch)
+    panel.append(squelchRow)
+
+    return panel
+  }
+
+  private buildRdsPanel(): HTMLElement {
+    const panel = el('div', 'panel rds-panel')
+    panel.append(el('h2', undefined, 'Radio data'))
+    panel.append(this.rdsName)
+    panel.append(this.rdsText)
+    return panel
+  }
+
+  private syncModeButtons() {
+    for (const [name, button] of this.modeButtons) {
+      button.classList.toggle('active', name === this.mode)
+    }
+  }
+
+  private updateFrequencyDisplay() {
+    const { value, unit } = formatFrequency(this.frequencyHz)
+    this.frequencyDisplay.replaceChildren(
+      document.createTextNode(value),
+      el('span', 'unit', unit),
+    )
+  }
+
