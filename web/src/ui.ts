@@ -266,3 +266,137 @@ export class ReceiverUI {
     )
   }
 
+  private setFrequency(hz: number) {
+    this.frequencyHz = Math.max(MIN_FREQUENCY_HZ, Math.min(MAX_FREQUENCY_HZ, hz))
+    this.updateFrequencyDisplay()
+    if (this.running) this.pipeline.tune(this.frequencyHz)
+  }
+
+  private async setMode(mode: DemodModeName) {
+    if (mode === this.mode) return
+    this.mode = mode
+    this.syncModeButtons()
+    // The channel rate and every filter depend on the mode, and they are fixed when a
+    // stage is constructed, so a mode change is a pipeline restart rather than a tweak.
+    if (this.running) await this.restart()
+  }
+
+  private async toggle() {
+    if (this.running) {
+      await this.stop()
+    } else {
+      await this.startPipeline()
+    }
+  }
+
+  private async startPipeline() {
+    this.clearNotice()
+    this.startButton.disabled = true
+    this.startButton.textContent = 'Connecting…'
+
+    try {
+      // The chooser must be opened from the page, inside this click. The device it grants
+      // is picked up again by the capture worker.
+      await this.pipeline.requestDevice()
+      await this.pipeline.start(this.frequencyHz, this.mode)
+
+      const defaults = defaultsFor(this.mode)
+      this.pipeline.setSquelch(defaults.squelch, defaults.squelchThreshold)
+      this.pipeline.setAgc(defaults.agc)
+      if (this.mode === 'wfm') this.pipeline.setDeemphasis(DEFAULT_DEEMPHASIS_US)
+
+      this.render = await startRendering(this.pipeline, this.canvases)
+      if (!this.render.usingGpu) {
+        this.showNotice(this.render.adapterInfo, false)
+      }
+
+      this.running = true
+      this.startButton.textContent = 'Disconnect'
+    } catch (error) {
+      this.onError(error instanceof Error ? error.message : String(error), true)
+      await this.stop()
+    } finally {
+      this.startButton.disabled = false
+    }
+  }
+
+  private async restart() {
+    await this.stop()
+    await this.startPipeline()
+  }
+
+  private async stop() {
+    this.render?.stop()
+    this.render = undefined
+    await this.pipeline.stop()
+    this.running = false
+    this.startButton.textContent = 'Connect receiver'
+  }
+
+  private onStatus(status: PipelineStatus) {
+    const rows: [string, string][] = []
+    if (status.capture) {
+      rows.push(['Tuned', formatFrequency(status.capture.tunedHz).value + ' MHz'])
+      rows.push(['Band', status.capture.band])
+      rows.push(['PLL', status.capture.locked ? 'locked' : 'unlocked'])
+      rows.push(['Throughput', `${(status.capture.bytesPerSecond / 1e6).toFixed(1)} MB/s`])
+      if (status.capture.dropped > 0) {
+        rows.push(['Dropped', String(status.capture.dropped)])
+      }
+    }
+    if (status.dsp) {
+      rows.push(['Stereo', status.dsp.stereo ? 'yes' : 'no'])
+      rows.push(['Squelch', status.dsp.squelchOpen ? 'open' : 'closed'])
+      rows.push(['Ring fill', `${Math.round(status.dsp.ringFill * 100)}%`])
+
+      this.rdsName.textContent = status.dsp.rds.stationName || '—'
+      this.rdsText.textContent = status.dsp.rds.radioText || ''
+    }
+    rows.push(['Audio underruns', String(status.audio.underruns)])
+    rows.push(['Latency', `${Math.round(status.audioLatency * 1000)} ms`])
+
+    this.stats.replaceChildren()
+    for (const [key, value] of rows) {
+      this.stats.append(el('span', 'key', key), el('span', 'value', value))
+    }
+
+    this.diagnostics.replaceChildren()
+    this.diagnostics.append(el('span', undefined, `SIMD: ${status.simdBackend}`))
+    if (this.render) {
+      this.diagnostics.append(el('span', undefined, `GPU: ${this.render.adapterInfo}`))
+    }
+    if (status.device) {
+      this.diagnostics.append(
+        el('span', undefined, status.device.isV4 ? 'RTL-SDR Blog V4' : 'RTL2832U'),
+      )
+    }
+  }
+
+  private onError(message: string, fatal: boolean) {
+    this.showNotice(message, fatal)
+    if (fatal) void this.stop()
+  }
+
+  private showNotice(message: string, error: boolean) {
+    const notice = el('div', error ? 'notice error' : 'notice')
+    // Multi-line messages carry the udev/blacklist instructions, which want a code block.
+    if (message.includes('\n')) {
+      const [first, ...rest] = message.split('\n')
+      notice.append(el('strong', undefined, first))
+      notice.append(el('pre', undefined, rest.join('\n').trim()))
+    } else {
+      notice.textContent = message
+    }
+    this.noticeArea.replaceChildren(notice)
+  }
+
+  private clearNotice() {
+    this.noticeArea.replaceChildren()
+  }
+
+  /** Tears everything down. The React wrapper calls this on unmount. */
+  async destroy() {
+    await this.stop()
+    this.root.replaceChildren()
+  }
+}
