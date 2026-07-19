@@ -1,0 +1,333 @@
+/*
+ * Styling for the standalone app.
+ *
+ * The tokens mirror the host site's palette so the embedded build inherits its theme
+ * rather than clashing with it, and the design language is deliberately square — no
+ * rounded corners anywhere, matching the site it slots into. When mounted inside that
+ * site these variables are already defined on :root, so the block below only supplies them
+ * for the standalone page.
+ */
+
+:root {
+  --surface: 12 12 14;
+  --surface-container: 22 22 26;
+  --surface-container-high: 32 32 38;
+  --on-surface: 232 232 236;
+  --on-surface-variant: 156 156 168;
+  --outline: 64 64 74;
+  --outline-variant: 44 44 52;
+  --primary: 130 180 255;
+  --on-primary: 8 20 40;
+  --error: 255 120 120;
+  --success: 120 220 160;
+
+  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
+  --sans: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --surface: 250 250 252;
+    --surface-container: 240 240 244;
+    --surface-container-high: 230 230 236;
+    --on-surface: 24 24 28;
+    --on-surface-variant: 90 90 102;
+    --outline: 180 180 190;
+    --outline-variant: 210 210 218;
+    --primary: 40 100 210;
+    --on-primary: 255 255 255;
+    --error: 200 40 40;
+    --success: 30 150 90;
+  }
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--sans);
+  background: rgb(var(--surface));
+  color: rgb(var(--on-surface));
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  border-bottom: 1px solid rgb(var(--outline-variant));
+  padding-bottom: 1rem;
+}
+
+.header h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.header .tagline {
+  color: rgb(var(--on-surface-variant));
+  font-size: 0.85rem;
+}
+
+.displays {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1rem;
+}
+
+.display-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: rgb(var(--outline-variant));
+  border: 1px solid rgb(var(--outline-variant));
+}
+
+.canvas-wrap {
+  position: relative;
+  background: rgb(var(--surface));
+  overflow: hidden;
+}
+
+.canvas-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.canvas-wrap.spectrum {
+  height: 180px;
+}
+.canvas-wrap.waterfall {
+  height: 320px;
+}
+
+.canvas-label {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: rgb(var(--on-surface-variant));
+  pointer-events: none;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.side {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.panel {
+  background: rgb(var(--surface-container));
+  border: 1px solid rgb(var(--outline-variant));
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.panel h2 {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: rgb(var(--on-surface-variant));
+}
+
+.frequency {
+  font-family: var(--mono);
+  font-size: 2rem;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+.frequency .unit {
+  font-size: 1rem;
+  color: rgb(var(--on-surface-variant));
+  margin-left: 0.25rem;
+}
+
+.control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.control-row label {
+  color: rgb(var(--on-surface-variant));
+}
+
+button {
+  font-family: var(--sans);
+  font-size: 0.85rem;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid rgb(var(--outline));
+  background: rgb(var(--surface-container-high));
+  color: rgb(var(--on-surface));
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+button:hover:not(:disabled) {
+  background: rgb(var(--outline-variant));
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: rgb(var(--primary));
+  color: rgb(var(--on-primary));
+  border-color: rgb(var(--primary));
+  font-weight: 600;
+}
+
+.mode-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+
+.mode-group button {
+  flex: 1;
+  min-width: 44px;
+  padding: 0.4rem 0.2rem;
+}
+
+.mode-group button.active {
+  background: rgb(var(--primary));
+  color: rgb(var(--on-primary));
+  border-color: rgb(var(--primary));
+}
+
+input[type='range'] {
+  width: 100%;
+  accent-color: rgb(var(--primary));
+}
+
+input[type='number'],
+select {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  padding: 0.35rem 0.5rem;
+  background: rgb(var(--surface));
+  color: rgb(var(--on-surface));
+  border: 1px solid rgb(var(--outline));
+  width: 100%;
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.3rem 0.75rem;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+}
+
+.stat-grid .key {
+  color: rgb(var(--on-surface-variant));
+}
+
+.stat-grid .value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  border: 1px solid rgb(var(--outline));
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.badge.on {
+  color: rgb(var(--success));
+  border-color: rgb(var(--success));
+}
+.badge.off {
+  color: rgb(var(--on-surface-variant));
+}
+
+.rds-panel {
+  font-family: var(--mono);
+}
+
+.rds-name {
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  min-height: 1.5em;
+}
+
+.rds-text {
+  font-size: 0.85rem;
+  color: rgb(var(--on-surface-variant));
+  min-height: 2.5em;
+  word-break: break-word;
+}
+
+.notice {
+  padding: 1rem;
+  border: 1px solid rgb(var(--outline));
+  background: rgb(var(--surface-container));
+  font-size: 0.9rem;
+}
+
+.notice.error {
+  border-color: rgb(var(--error));
+  color: rgb(var(--error));
+}
+
+.notice pre {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  margin-top: 0.5rem;
+  color: rgb(var(--on-surface-variant));
+}
+
+.diagnostics {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: rgb(var(--on-surface-variant));
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+}
+
+@media (min-width: 900px) {
+  .displays {
+    grid-template-columns: 3fr 1fr;
+  }
+  .constellation-wrap {
+    height: 100%;
+    min-height: 200px;
+  }
+}
