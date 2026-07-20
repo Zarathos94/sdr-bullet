@@ -100,6 +100,7 @@ export class ReceiverUI {
   private band: BandName = 'fm'
   private view: ViewMode = 'radio'
   private running = false
+  private lastHealthLog = 0
   private stations: FoundStation[] = []
   private presets: (PresetSlot | null)[] = new Array(PRESET_SLOTS).fill(null)
 
@@ -736,6 +737,10 @@ export class ReceiverUI {
   private async startPipeline() {
     this.clearNotice()
     this.setConnectionUi('connecting')
+    // Unlock audio now, while the click's user activation is still live — before
+    // requestDevice() opens the USB chooser and spends it. A context created after the
+    // chooser is born suspended and stays silent, which is the "connected but no audio" bug.
+    void this.pipeline.unlockAudio()
 
     try {
       await this.pipeline.requestDevice()
@@ -801,6 +806,22 @@ export class ReceiverUI {
   // -- Status -------------------------------------------------------------
 
   private onStatus(status: PipelineStatus) {
+    // A throttled health line, so a silent pipeline can be diagnosed from the console:
+    // throughput 0 → the device is not streaming; framesDelivered stuck at 0 → the audio
+    // context never started (worklet not running); underruns climbing while framesDelivered
+    // grows → the ring is starving. All three read very differently here.
+    const now = performance.now()
+    if (now - this.lastHealthLog > 3000) {
+      this.lastHealthLog = now
+      const cap = status.capture
+      console.info(
+        `[sdr] throughput ${cap ? (cap.bytesPerSecond / 1e6).toFixed(2) : '—'} MB/s · ` +
+          `PLL ${cap ? (cap.locked ? 'lock' : 'unlock') : '—'} · ` +
+          `IQ ring ${status.dsp ? Math.round(status.dsp.ringFill * 100) : 0}% · ` +
+          `audio frames ${status.audio.framesDelivered} · underruns ${status.audio.underruns}`,
+      )
+    }
+
     if (status.dsp) {
       const stereo = status.dsp.stereo
       this.radioStereo.textContent = stereo ? 'STEREO' : 'MONO'

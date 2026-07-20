@@ -305,6 +305,15 @@ export class Pipeline {
     this.audio.setVolume(value)
   }
 
+  /**
+   * Unlocks the audio context. Must be called synchronously from the connect gesture, before
+   * the device chooser spends the user activation — otherwise the context is born suspended
+   * and stays silent. See {@link AudioOutput.unlock}.
+   */
+  async unlockAudio(): Promise<void> {
+    await this.audio.unlock(48_000)
+  }
+
   setSpectrumSmoothing(alpha: number): void {
     if (this.spectrumWorker) {
       this.post<ToSpectrum>(this.spectrumWorker, { type: 'smoothing', alpha })

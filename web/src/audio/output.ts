@@ -30,10 +30,29 @@ export class AudioOutput {
    * Must be called from a user gesture — an `AudioContext` created outside one starts
    * suspended.
    */
+  /**
+   * Creates and resumes the AudioContext. Call this synchronously from the connect click,
+   * before anything awaits: opening the WebUSB device chooser spends the click's user
+   * activation, so a context created afterwards starts suspended and never makes a sound —
+   * which is exactly the "connected, no errors, no audio" symptom. Creating it here, while
+   * the gesture is still live, gets a running context.
+   */
+  async unlock(sampleRate: number): Promise<void> {
+    if (!this.context) {
+      this.context = new AudioContext({ sampleRate, latencyHint: 'interactive' })
+    }
+    if (this.context.state === 'suspended') {
+      await this.context.resume().catch(() => {})
+    }
+  }
+
   async start(ring: SharedArrayBuffer, sampleRate: number): Promise<void> {
     // Asking for the pipeline's own rate avoids a resampling stage inside the browser,
-    // which would add both latency and a filter nobody chose.
-    this.context = new AudioContext({ sampleRate, latencyHint: 'interactive' })
+    // which would add both latency and a filter nobody chose. Reuse the context unlock()
+    // already created in the gesture if there is one.
+    if (!this.context) {
+      this.context = new AudioContext({ sampleRate, latencyHint: 'interactive' })
+    }
 
     await this.context.audioWorklet.addModule(sinkUrl)
 
@@ -61,7 +80,19 @@ export class AudioOutput {
 
     // Autoplay policy leaves a context suspended until a gesture resumes it.
     if (this.context.state === 'suspended') {
-      await this.context.resume()
+      await this.context.resume().catch(() => {})
+    }
+    // If it is still suspended — the gesture was spent before we got here — resume on the
+    // next user interaction anywhere in the page, then stop listening once it takes.
+    if (this.context.state === 'suspended') {
+      const events = ['pointerdown', 'keydown', 'touchend'] as const
+      const resume = () => {
+        void this.context?.resume().catch(() => {})
+        if (this.context?.state === 'running') {
+          events.forEach((event) => window.removeEventListener(event, resume))
+        }
+      }
+      events.forEach((event) => window.addEventListener(event, resume))
     }
   }
 
