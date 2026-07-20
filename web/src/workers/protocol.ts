@@ -87,6 +87,8 @@ export interface DspStatus {
   squelchOpen: boolean
   pilotLevel: number
   ringFill: number
+  /** Lag-1 autocorrelation of the demodulated audio: ~0 is noise, near 1 is real program. */
+  audioAutocorr: number
   rds: {
     synchronised: boolean
     stationName: string

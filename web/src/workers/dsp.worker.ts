@@ -17,6 +17,7 @@ import { MODE_VALUES, type DspConfig, type FromWorker, type ToDsp } from './prot
 
 let stage: ChannelStage | undefined
 let running = false
+let audioAutocorr = 0
 
 function post(message: FromWorker) {
   self.postMessage(message)
@@ -59,6 +60,21 @@ async function start(config: DspConfig) {
         interleaved[k * 2 + 1] = right[k]!
       }
       audio.write(interleaved.subarray(0, frames * 2))
+
+      // Is the audio the demod just produced real program, or noise? Lag-1 autocorrelation
+      // separates them: band-limited speech/music is strongly correlated sample-to-sample
+      // (~0.7+), white static is near 0. Smoothed so it reads steadily.
+      if (frames > 16) {
+        let mean = 0
+        for (let k = 0; k < frames; k++) mean += left[k]!
+        mean /= frames
+        let num = 0
+        let den = 0
+        for (let k = 1; k < frames; k++) num += (left[k]! - mean) * (left[k - 1]! - mean)
+        for (let k = 0; k < frames; k++) den += (left[k]! - mean) * (left[k]! - mean)
+        const ac = den > 1e-9 ? num / den : 0
+        audioAutocorr += 0.2 * (ac - audioAutocorr)
+      }
     }
 
     const now = performance.now()
@@ -69,6 +85,7 @@ async function start(config: DspConfig) {
         squelchOpen: stage.squelch_open(),
         pilotLevel: stage.pilot_level(),
         ringFill: iq.fill(),
+        audioAutocorr,
         rds: {
           synchronised: stage.rds_synchronised(),
           stationName: stage.rds_station_name(),

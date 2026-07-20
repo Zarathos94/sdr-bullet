@@ -820,6 +820,7 @@ export class ReceiverUI {
           `PLL ${cap ? (cap.locked ? 'lock' : 'unlock') : '—'} · ` +
           `signal ${cap ? cap.powerDbfs.toFixed(1) : '—'} dBFS · ` +
           `pilot ${status.dsp ? status.dsp.pilotLevel.toFixed(4) : '—'} ${status.dsp?.stereo ? 'STEREO' : 'mono'} · ` +
+          `audio-real ${status.dsp ? status.dsp.audioAutocorr.toFixed(2) : '—'} · ` +
           `dropped ${cap ? cap.dropped : '—'} · ` +
           `IQ ring ${status.dsp ? Math.round(status.dsp.ringFill * 100) : 0}% · ` +
           `audio frames ${status.audio.framesDelivered} · underruns ${status.audio.underruns}`,
