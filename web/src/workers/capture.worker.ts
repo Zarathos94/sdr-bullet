@@ -48,7 +48,14 @@ async function start(config: CaptureConfig) {
   post({ type: 'ready', simdBackend: simd_backend() })
 
   transport = await UsbTransport.open()
-  receiver = await Receiver.open(transport, config.isV4 || transport.identity.isV4)
+  const isV4 = config.isV4 || transport.identity.isV4
+  // V4 detection sets the tuner reference clock; getting it wrong is nothing but static, so
+  // make the resolved identity visible for diagnosis.
+  console.info(
+    `[sdr] device "${transport.identity.manufacturer ?? '?'}" / "${transport.identity.product ?? '?'}"` +
+      ` — V4=${isV4} (28.8 MHz reference ${isV4 ? 'on' : 'OFF — will mistune unless this is a generic R828D'})`,
+  )
+  receiver = await Receiver.open(transport, isV4)
 
   const actualRate = await receiver.setSampleRate(config.sampleRate)
   await receiver.setGain(config.gainTenths)

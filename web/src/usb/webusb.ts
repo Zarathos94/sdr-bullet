@@ -68,6 +68,66 @@ function identify(device: USBDevice): DeviceIdentity {
   }
 }
 
+/** Reads a USB string descriptor by index as UTF-16LE. The device must be open. */
+async function readStringDescriptor(device: USBDevice, index: number): Promise<string | undefined> {
+  if (!index) return undefined
+  try {
+    const result = await device.controlTransferIn(
+      // GET_DESCRIPTOR (0x06), STRING type (0x03) in the high byte, English (0x0409) language.
+      { requestType: 'standard', recipient: 'device', request: 0x06, value: 0x0300 | index, index: 0x0409 },
+      255,
+    )
+    if (result.status !== 'ok' || !result.data || result.data.byteLength < 2) return undefined
+    const bytes = new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength)
+    // First byte is the length in bytes (including the two-byte header), then UTF-16LE.
+    const end = Math.min(bytes[0] || bytes.byteLength, bytes.byteLength)
+    const text = new TextDecoder('utf-16le').decode(bytes.subarray(2, end)).replace(/\0+$/, '')
+    return text || undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Resolves the device identity, reading the descriptor strings off the wire when WebUSB has
+ * not populated the accessors — which it does not reliably do on every platform.
+ *
+ * This matters far more than a cosmetic label: the whole V4 detection rides on these two
+ * strings, and V4 detection decides the tuner's reference clock. Miss it and every
+ * synthesiser calculation uses 16 MHz where the hardware runs at 28.8, so the radio lands
+ * nearly two-fold off frequency and receives nothing but static on every station. The device
+ * must already be open.
+ */
+async function resolveIdentity(device: USBDevice): Promise<DeviceIdentity> {
+  let manufacturer = device.manufacturerName ?? undefined
+  let product = device.productName ?? undefined
+  const serial = device.serialNumber ?? undefined
+
+  if (!manufacturer || !product) {
+    try {
+      // Device descriptor: iManufacturer at byte 14, iProduct at 15 — the string indices.
+      const descriptor = await device.controlTransferIn(
+        { requestType: 'standard', recipient: 'device', request: 0x06, value: 0x0100, index: 0 },
+        18,
+      )
+      if (descriptor.status === 'ok' && descriptor.data && descriptor.data.byteLength >= 16) {
+        const b = new Uint8Array(descriptor.data.buffer, descriptor.data.byteOffset, descriptor.data.byteLength)
+        if (!manufacturer) manufacturer = await readStringDescriptor(device, b[14]!)
+        if (!product) product = await readStringDescriptor(device, b[15]!)
+      }
+    } catch {
+      // Keep whatever the accessors gave us.
+    }
+  }
+
+  return {
+    manufacturer,
+    product,
+    serial,
+    isV4: manufacturer === V4_MANUFACTURER && product === V4_PRODUCT,
+  }
+}
+
 /** Whether this browser can talk to USB devices at all. */
 export function isSupported(): boolean {
   return typeof navigator !== 'undefined' && 'usb' in navigator
@@ -163,7 +223,7 @@ export class UsbTransport {
       throw new Error(describeClaimFailure(error))
     }
 
-    return new UsbTransport(device, identify(device))
+    return new UsbTransport(device, await resolveIdentity(device))
   }
 
   /** Vendor control transfer, host to device. */
