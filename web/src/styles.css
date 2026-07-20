@@ -455,6 +455,23 @@ select {
   justify-content: center;
   padding: 0.6rem;
 }
+
+/* Inline-SVG icons: sized in em so the font-size rules below still control them, and
+ * vertically centred so they sit correctly next to button text. */
+.material-symbols-outlined {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  vertical-align: -0.15em;
+  font-size: 20px;
+}
+.material-symbols-outlined svg {
+  display: block;
+  width: 1em;
+  height: 1em;
+}
+
 .radio-btn .material-symbols-outlined {
   font-size: 22px;
 }

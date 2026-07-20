@@ -54,8 +54,32 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return node
 }
 
+// Inline SVG icons. The app runs cross-origin-isolated (COEP: require-corp) inside the
+// site's iframe, which blocks the Google Fonts icon stylesheet — so icons are drawn as
+// self-contained SVG with no network dependency, rather than as an icon font whose glyphs
+// would otherwise fall back to their raw ligature text ("chevron_left", "radar", …).
+const ICON_GLYPHS: Record<string, string> = {
+  chevron_left: '<polyline points="15 5 8 12 15 19"/>',
+  chevron_right: '<polyline points="9 5 16 12 9 19"/>',
+  keyboard_double_arrow_left: '<polyline points="18 6 12 12 18 18"/><polyline points="11 6 5 12 11 18"/>',
+  keyboard_double_arrow_right: '<polyline points="6 6 12 12 6 18"/><polyline points="13 6 19 12 13 18"/>',
+  radar:
+    '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.2"/>' +
+    '<line x1="12" y1="12" x2="19" y2="8"/>' +
+    '<circle cx="12" cy="12" r="1.15" fill="currentColor" stroke="none"/>',
+  stop: '<rect x="6.5" y="6.5" width="11" height="11" rx="1" fill="currentColor" stroke="none"/>',
+}
+
 function icon(name: string): HTMLElement {
-  return el('span', 'material-symbols-outlined', name)
+  const span = el('span', 'material-symbols-outlined')
+  span.setAttribute('aria-hidden', 'true')
+  const glyph = ICON_GLYPHS[name] ?? ''
+  span.innerHTML =
+    '<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    glyph +
+    '</svg>'
+  return span
 }
 
 interface PresetSlot {
