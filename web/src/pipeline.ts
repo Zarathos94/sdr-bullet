@@ -67,6 +67,7 @@ export class Pipeline {
   private readonly bins = new Float32Array(FFT_SIZE)
   private readonly constellationFrame = new Float32Array(FFT_SIZE * 2)
   private readonly peekBins = new Float32Array(FFT_SIZE)
+  private readonly peekConstellationFrame = new Float32Array(FFT_SIZE * 2)
 
   private device: DeviceIdentity | undefined
   private simdBackend = 'unknown'
@@ -256,6 +257,18 @@ export class Pipeline {
     if (!this.constellationSource) return null
     return this.constellationSource.consume(this.constellationFrame)
       ? this.constellationFrame
+      : null
+  }
+
+  /**
+   * The newest baseband frame without consuming it, so the scope can read the same I/Q the
+   * render loop's constellation is already draining — the peek/consume split the scanner
+   * uses for the spectrum.
+   */
+  peekConstellation(): Float32Array | null {
+    if (!this.constellationSource) return null
+    return this.constellationSource.peek(this.peekConstellationFrame)
+      ? this.peekConstellationFrame
       : null
   }
 

@@ -14,6 +14,7 @@
  */
 
 import { DemoDisplay } from './demo.js'
+import { ScopeDisplay } from './scope.js'
 import { Pipeline, type PipelineStatus } from './pipeline.js'
 import { startRendering, type RenderHandle } from './render.js'
 import { Scanner, SCAN_BANDS, type FoundStation, type ScanBand } from './scan.js'
@@ -30,6 +31,14 @@ import type { DemodModeName } from './workers/protocol.js'
 
 type ViewMode = 'radio' | 'spectrum'
 type BandName = 'fm' | 'am'
+/** Which visualisation fills the stage — the "additional views" over one shared signal. */
+type DisplayMode = 'panorama' | 'constellation' | 'scope'
+
+const DISPLAY_TABS: { mode: DisplayMode; label: string }[] = [
+  { mode: 'panorama', label: 'Panorama' },
+  { mode: 'constellation', label: 'Constellation' },
+  { mode: 'scope', label: 'Scope' },
+]
 
 const MODES: { name: DemodModeName; label: string }[] = [
   { name: 'wfm', label: 'WFM' },
@@ -99,6 +108,7 @@ export class ReceiverUI {
   private mode: DemodModeName = 'wfm'
   private band: BandName = 'fm'
   private view: ViewMode = 'radio'
+  private displayMode: DisplayMode = 'panorama'
   private running = false
   private lastHealthLog = 0
   private stations: FoundStation[] = []
@@ -110,6 +120,17 @@ export class ReceiverUI {
     constellation: HTMLCanvasElement
   }
   private readonly demoCanvas = el('canvas', 'demo-canvas')
+  private readonly scopeCanvas = el('canvas', 'scope-canvas')
+  private scope: ScopeDisplay | undefined
+
+  // Console shell: a top bar, then a workspace split into a display stage and a control rail.
+  private readonly stage = el('div', 'stage')
+  private readonly rail = el('div', 'rail')
+  private readonly displayArea = el('div', 'display-area')
+  private readonly displayTabs = el('div', 'display-tabs')
+  private readonly radioRail = el('div', 'rail-view radio-rail')
+  private readonly spectrumRail = el('div', 'rail-view spectrum-rail')
+  private readonly signalDb = el('span', 'signal-db', '—')
 
   // Shared DOM references.
   private readonly diagnostics = el('div', 'diagnostics')
@@ -117,8 +138,6 @@ export class ReceiverUI {
   private readonly statusDot = el('span', 'status-dot')
   private readonly statusText = el('span', 'status-text', 'Offline')
   private readonly noticeArea = el('div')
-  private readonly radioView = el('div', 'view radio-view')
-  private readonly spectrumView = el('div', 'view spectrum-view')
   private readonly viewToggle = el('div', 'view-toggle')
   private readonly gpuCanvasWrap = el('div', 'gpu-displays')
 
@@ -135,7 +154,6 @@ export class ReceiverUI {
   private readonly presetButtons: HTMLButtonElement[] = []
 
   // Spectrum view references.
-  private readonly frequencyDisplay = el('div', 'frequency')
   private readonly rdsName = el('div', 'rds-name')
   private readonly rdsText = el('div', 'rds-text')
   private readonly stats = el('div', 'stat-grid')
@@ -158,21 +176,20 @@ export class ReceiverUI {
   private build() {
     this.root.replaceChildren()
 
-    // Top action bar: identity on the left, the primary Connect action and a live-status
-    // pill on the right, so the one thing a first-time visitor must do is always in view
-    // and unmistakable rather than buried among the controls.
-    const header = el('div', 'header')
-    const title = el('div', 'brand')
-    title.append(el('h1', undefined, 'sdr-bullet'))
-    title.append(el('div', 'tagline', 'A software radio in the browser · WebUSB · Rust/WASM · GPU'))
+    // Top bar: a compact app mark, the Radio/Spectrum switch, and the primary Connect action
+    // with a live-status pill. The host page already headlines "sdr-bullet", so this bar
+    // deliberately does *not* repeat that title — it is chrome, not a second masthead.
+    const topbar = el('div', 'topbar')
+    const mark = el('div', 'brand-mark')
+    mark.append(icon('radar'), el('span', 'mark-text', 'Receiver'))
 
     const actions = el('div', 'topbar-actions')
     const statusPill = el('div', 'status-pill')
     statusPill.append(this.statusDot, this.statusText)
     actions.append(statusPill, this.connectButton)
 
-    header.append(title, actions)
-    this.root.append(header)
+    topbar.append(mark, this.buildViewToggle(), actions)
+    this.root.append(topbar)
     this.root.classList.add('offline')
 
     const capability = Pipeline.capabilities()
@@ -184,21 +201,26 @@ export class ReceiverUI {
       return
     }
 
-    this.root.append(this.buildViewToggle())
     this.root.append(this.noticeArea)
-    this.root.append(this.buildDisplays())
-    this.buildRadioView()
-    this.buildSpectrumView()
-    this.root.append(this.radioView)
-    this.root.append(this.spectrumView)
+
+    // Workspace: a display stage and a control rail, both bounded by the frame. The rail
+    // scrolls internally if its panels overflow, so the app itself never scrolls — it is
+    // sized to fit the embed exactly rather than running off the bottom of it.
+    const workspace = el('div', 'workspace')
+    this.buildStage()
+    this.buildRadioRail()
+    this.buildSpectrumRail()
+    this.rail.append(this.radioRail, this.spectrumRail)
+    workspace.append(this.stage, this.rail)
+    this.root.append(workspace)
 
     const footer = el('div', 'app-footer')
     footer.append(this.diagnostics)
     this.root.append(footer)
 
     this.setView('radio')
+    this.setDisplayMode('panorama')
     this.updateRadioDisplay()
-    this.updateFrequencyDisplay()
     this.startDemo()
 
     this.connectButton.addEventListener('click', () => void this.toggle())
@@ -217,10 +239,23 @@ export class ReceiverUI {
     return this.viewToggle
   }
 
-  private buildDisplays(): HTMLElement {
-    const displays = el('div', 'displays')
+  /**
+   * The display stage: a selector for which visualisation fills it, the display area itself,
+   * and the tuning transport pinned under it. The three displays are stacked in the same box
+   * and cross-faded by the selector rather than torn down, so the GPU render targets keep
+   * their size and switching views is instant.
+   */
+  private buildStage() {
+    for (const { mode, label } of DISPLAY_TABS) {
+      const button = el('button', undefined, label)
+      button.dataset['disp'] = mode
+      button.addEventListener('click', () => this.setDisplayMode(mode))
+      this.displayTabs.append(button)
+    }
 
-    // The WebGPU displays, hidden behind the demo until a device is connected.
+    // Panorama — the GPU spectrum trace over the scrolling waterfall, with the demo / 2D
+    // fallback canvas overlaid on top of it.
+    const panorama = el('div', 'disp disp-panorama active')
     const stack = el('div', 'display-stack')
     for (const [key, label] of [
       ['spectrum', 'Spectrum'],
@@ -232,42 +267,56 @@ export class ReceiverUI {
       stack.append(wrap)
     }
     this.gpuCanvasWrap.append(stack)
-
-    const constellationWrap = el('div', 'canvas-wrap constellation-wrap')
-    constellationWrap.append(this.canvases.constellation)
-    constellationWrap.append(el('div', 'canvas-label', 'Constellation'))
-    this.gpuCanvasWrap.append(constellationWrap)
-
-    // The demo overlay sits on top and covers the displays until we go live.
     const demoWrap = el('div', 'canvas-wrap demo-wrap')
     demoWrap.append(this.demoCanvas)
-    demoWrap.append(
-      el('div', 'canvas-label', 'Demo signal · press Connect (top right) for live reception'),
+    demoWrap.append(el('div', 'canvas-label', 'Demo signal · Connect for live reception'))
+    panorama.append(this.gpuCanvasWrap, demoWrap)
+
+    // Constellation — the GPU I/Q density plot.
+    const constellation = el('div', 'disp disp-constellation')
+    const constellationWrap = el('div', 'canvas-wrap constellation-wrap')
+    constellationWrap.append(this.canvases.constellation)
+    constellationWrap.append(el('div', 'canvas-label', 'Constellation · I/Q density'))
+    constellation.append(
+      constellationWrap,
+      el('div', 'disp-hint', 'Connect the receiver to plot the constellation'),
     )
 
-    displays.append(this.gpuCanvasWrap)
-    displays.append(demoWrap)
-    return displays
+    // Scope — the Canvas2D baseband oscilloscope.
+    const scope = el('div', 'disp disp-scope')
+    const scopeWrap = el('div', 'canvas-wrap scope-wrap')
+    scopeWrap.append(this.scopeCanvas)
+    scopeWrap.append(el('div', 'canvas-label', 'Scope · baseband I/Q vs time'))
+    scope.append(scopeWrap)
+
+    this.displayArea.append(panorama, constellation, scope)
+    this.stage.append(this.displayTabs, this.displayArea, this.buildTransport())
   }
 
-  // -- Radio view ---------------------------------------------------------
+  /**
+   * The tuning transport, pinned under the display in both views: band select, a large
+   * frequency readout flanked by seek/tune (the readout itself tunes on scroll or arrow
+   * keys), and a compact "what am I hearing" strip — signal meter, stereo, station name.
+   */
+  private buildTransport(): HTMLElement {
+    const bar = el('div', 'transport')
 
-  private buildRadioView() {
-    const dial = el('div', 'panel radio-dial')
-
-    const top = el('div', 'radio-top')
-    const bandRow = el('div', 'radio-bandrow')
+    const bands = el('div', 'transport-bands')
     for (const name of ['fm', 'am'] as const) {
       const button = el('button', undefined, SCAN_BANDS[name].label)
       button.addEventListener('click', () => void this.setBand(name))
       this.bandTabs.set(name, button)
-      bandRow.append(button)
+      bands.append(button)
     }
-    top.append(bandRow)
-    top.append(this.radioStereo)
-    dial.append(top)
 
-    // The frequency readout doubles as a tuning surface: scroll to step channels.
+    const mk = (title: string, glyph: string, onClick: () => void) => {
+      const b = el('button', 'radio-btn')
+      b.title = title
+      b.setAttribute('aria-label', title)
+      b.append(icon(glyph))
+      b.addEventListener('click', onClick)
+      return b
+    }
     this.radioFreq.tabIndex = 0
     this.radioFreq.addEventListener('wheel', (event) => {
       event.preventDefault()
@@ -277,37 +326,36 @@ export class ReceiverUI {
       if (event.key === 'ArrowUp' || event.key === 'ArrowRight') this.tuneStep(1)
       if (event.key === 'ArrowDown' || event.key === 'ArrowLeft') this.tuneStep(-1)
     })
-    const freqWrap = el('div', 'radio-freq-wrap')
+    const freqWrap = el('div', 'tuner-freq')
     freqWrap.append(this.radioFreq, this.radioBandLabel)
-    dial.append(freqWrap)
-
-    // Seek / tune controls.
-    const transport = el('div', 'radio-transport')
-    const mk = (title: string, glyph: string, onClick: () => void) => {
-      const b = el('button', 'radio-btn')
-      b.title = title
-      b.setAttribute('aria-label', title)
-      b.append(icon(glyph))
-      b.addEventListener('click', onClick)
-      return b
-    }
-    transport.append(
+    const tuner = el('div', 'tuner')
+    tuner.append(
       mk('Seek down', 'keyboard_double_arrow_left', () => void this.seek(-1)),
       mk('Tune down', 'chevron_left', () => this.tuneStep(-1)),
+      freqWrap,
       mk('Tune up', 'chevron_right', () => this.tuneStep(1)),
       mk('Seek up', 'keyboard_double_arrow_right', () => void this.seek(1)),
     )
-    dial.append(transport)
 
-    // Signal strength meter + station name / radio text.
     const meter = el('div', 'meter')
     meter.append(this.signalBar)
-    dial.append(meter)
-    const rds = el('div', 'radio-rds')
+    const meterWrap = el('div', 'meter-wrap')
+    meterWrap.append(el('span', 'meter-cap', 'Signal'), meter, this.signalDb)
+    const rds = el('div', 'transport-rds')
     this.radioName.textContent = '—'
     rds.append(this.radioName, this.radioText)
-    dial.append(rds)
+    const readout = el('div', 'transport-readout')
+    readout.append(this.radioStereo, meterWrap, rds)
 
+    bar.append(bands, tuner, readout)
+    return bar
+  }
+
+  // -- Radio rail (consumer controls) -------------------------------------
+
+  private buildRadioRail() {
+    const audio = el('div', 'panel')
+    audio.append(el('h2', undefined, 'Audio'))
     const volumeRow = el('div', 'control-row')
     volumeRow.append(el('label', undefined, 'Volume'))
     const volume = el('input')
@@ -317,9 +365,8 @@ export class ReceiverUI {
     volume.value = '70'
     volume.addEventListener('input', () => this.pipeline.setVolume(Number(volume.value) / 100))
     volumeRow.append(volume)
-    dial.append(volumeRow)
-
-    this.radioView.append(dial)
+    audio.append(volumeRow)
+    this.radioRail.append(audio)
 
     // Presets.
     const presetPanel = el('div', 'panel')
@@ -336,35 +383,30 @@ export class ReceiverUI {
       presetGrid.append(button)
     }
     presetPanel.append(presetGrid)
-    presetPanel.append(
-      el('p', 'hint', 'Click to recall · right-click to save the current station'),
-    )
-    this.radioView.append(presetPanel)
+    presetPanel.append(el('p', 'hint', 'Click to recall · right-click to save'))
+    this.radioRail.append(presetPanel)
 
     // Station catalogue + scan.
-    const scanPanel = el('div', 'panel')
+    const scanPanel = el('div', 'panel scan-panel')
     const scanHeader = el('div', 'panel-header')
     scanHeader.append(el('h2', undefined, 'Stations'))
-    this.scanButton.append(icon('radar'), document.createTextNode('Scan band'))
+    this.scanButton.append(icon('radar'), document.createTextNode('Scan'))
     this.scanButton.addEventListener('click', () => void this.scan())
     scanHeader.append(this.scanButton)
     scanPanel.append(scanHeader)
     scanPanel.append(this.stationList)
-    this.radioView.append(scanPanel)
+    this.radioRail.append(scanPanel)
 
     this.renderStations()
     this.syncBandTabs()
     this.renderPresets()
   }
 
-  // -- Spectrum (advanced) view ------------------------------------------
+  // -- Spectrum rail (advanced controls) ---------------------------------
 
-  private buildSpectrumView() {
-    const side = el('div', 'side')
-
+  private buildSpectrumRail() {
     const tuning = el('div', 'panel')
     tuning.append(el('h2', undefined, 'Tuning'))
-    tuning.append(this.frequencyDisplay)
     const input = el('input')
     input.type = 'text'
     input.placeholder = 'e.g. 98.5M, 7100k, 145000000'
@@ -389,10 +431,10 @@ export class ReceiverUI {
       void this.applyModeAndTune(preset.mode, preset.frequencyHz, preset.deemphasisUs)
     })
     tuning.append(presetSelect)
-    side.append(tuning)
+    this.spectrumRail.append(tuning)
 
     const modePanel = el('div', 'panel')
-    modePanel.append(el('h2', undefined, 'Mode'))
+    modePanel.append(el('h2', undefined, 'Demodulator'))
     const modeGroup = el('div', 'mode-group')
     for (const { name, label } of MODES) {
       const button = el('button', undefined, label)
@@ -402,21 +444,19 @@ export class ReceiverUI {
     }
     modePanel.append(modeGroup)
     this.syncModeButtons()
-    side.append(modePanel)
+    this.spectrumRail.append(modePanel)
 
-    side.append(this.buildAudioPanel())
+    this.spectrumRail.append(this.buildAudioPanel())
 
     const rdsPanel = el('div', 'panel rds-panel')
     rdsPanel.append(el('h2', undefined, 'Radio data'))
     rdsPanel.append(this.rdsName, this.rdsText)
-    side.append(rdsPanel)
+    this.spectrumRail.append(rdsPanel)
 
     const statusPanel = el('div', 'panel')
     statusPanel.append(el('h2', undefined, 'Signal'))
     statusPanel.append(this.stats)
-    side.append(statusPanel)
-
-    this.spectrumView.append(side)
+    this.spectrumRail.append(statusPanel)
   }
 
   private buildAudioPanel(): HTMLElement {
@@ -451,10 +491,21 @@ export class ReceiverUI {
 
   private setView(view: ViewMode) {
     this.view = view
-    this.radioView.classList.toggle('hidden', view !== 'radio')
-    this.spectrumView.classList.toggle('hidden', view !== 'spectrum')
+    this.radioRail.classList.toggle('hidden', view !== 'radio')
+    this.spectrumRail.classList.toggle('hidden', view !== 'spectrum')
     for (const button of this.viewToggle.querySelectorAll('button')) {
       button.classList.toggle('active', button.dataset['view'] === view)
+    }
+  }
+
+  /** Cross-fades the stage to the chosen visualisation without disturbing the render loop. */
+  private setDisplayMode(mode: DisplayMode) {
+    this.displayMode = mode
+    for (const disp of this.displayArea.querySelectorAll<HTMLElement>('.disp')) {
+      disp.classList.toggle('active', disp.classList.contains(`disp-${mode}`))
+    }
+    for (const button of this.displayTabs.querySelectorAll('button')) {
+      button.classList.toggle('active', button.dataset['disp'] === mode)
     }
   }
 
@@ -473,11 +524,25 @@ export class ReceiverUI {
     }
   }
 
+  /** The scope runs for the life of the app — an idle sweep offline, live baseband when
+   * connected — so switching to the Scope tab is always instant and never blank. */
+  private ensureScope() {
+    if (this.scope) return
+    try {
+      this.scope = new ScopeDisplay(this.scopeCanvas)
+      this.scope.start()
+    } catch {
+      // No 2D context: the scope tab simply stays empty.
+    }
+  }
+
   /** The synthetic pre-connect demo. */
   private startDemo() {
     if (this.running) return
     this.ensureDemo()
+    this.ensureScope()
     this.demo?.setSource(null)
+    this.scope?.setSource(null)
     document.querySelector('.demo-wrap')?.classList.remove('hidden')
     this.gpuCanvasWrap.classList.add('hidden')
   }
@@ -515,7 +580,6 @@ export class ReceiverUI {
 
   private setFrequency(hz: number) {
     this.frequencyHz = Math.max(MIN_FREQUENCY_HZ, Math.min(MAX_FREQUENCY_HZ, hz))
-    this.updateFrequencyDisplay()
     this.updateRadioDisplay()
     if (this.running) this.pipeline.tune(this.frequencyHz)
   }
@@ -540,7 +604,6 @@ export class ReceiverUI {
       if (found !== null) {
         this.frequencyHz = found
         this.updateRadioDisplay()
-        this.updateFrequencyDisplay()
       }
     } finally {
       this.setTransportBusy(false)
@@ -564,7 +627,6 @@ export class ReceiverUI {
     this.band = hz < 30_000_000 ? 'am' : 'fm'
     this.syncModeButtons()
     this.syncBandTabs()
-    this.updateFrequencyDisplay()
     this.updateRadioDisplay()
 
     if (this.running) {
@@ -648,7 +710,7 @@ export class ReceiverUI {
   }
 
   private setTransportBusy(busy: boolean) {
-    for (const button of this.radioView.querySelectorAll<HTMLButtonElement>('.radio-btn')) {
+    for (const button of this.stage.querySelectorAll<HTMLButtonElement>('.radio-btn')) {
       button.disabled = busy
     }
   }
@@ -755,6 +817,8 @@ export class ReceiverUI {
       // receiver down: mark it live before touching the GPU so a display failure is isolated.
       this.running = true
       this.setConnectionUi('live')
+      // Feed the scope the live baseband; it peeks the same I/Q slot the constellation drains.
+      this.scope?.setSource(() => this.pipeline.peekConstellation())
 
       // Try WebGPU; if it is unavailable or throws — common for WebGPU on Linux inside this
       // cross-origin-isolated frame, where the Vulkan external-semaphore share fails — fall
@@ -799,6 +863,7 @@ export class ReceiverUI {
     this.render = undefined
     await this.pipeline.stop()
     this.running = false
+    this.scope?.setSource(null)
     this.setConnectionUi('offline')
     if (!options.keepDemoOff) this.startDemo()
   }
@@ -852,6 +917,7 @@ export class ReceiverUI {
       // -55 dBFS, a strong local station near -10, so map that span onto the bar.
       const strength = Math.max(0, Math.min(1, (status.capture.powerDbfs + 55) / 50))
       this.signalBar.style.width = `${Math.round(strength * 100)}%`
+      this.signalDb.textContent = `${status.capture.powerDbfs.toFixed(0)} dBFS`
     }
     if (status.dsp) {
       rows.push(['Stereo', status.dsp.stereo ? 'yes' : 'no'])
@@ -890,14 +956,6 @@ export class ReceiverUI {
     this.radioBandLabel.textContent = `${SCAN_BANDS[this.band].label} · ${this.mode.toUpperCase()}`
   }
 
-  private updateFrequencyDisplay() {
-    const { value, unit } = formatFrequency(this.frequencyHz)
-    this.frequencyDisplay.replaceChildren(
-      document.createTextNode(value),
-      el('span', 'unit', unit),
-    )
-  }
-
   private syncModeButtons() {
     for (const [name, button] of this.modeButtons) {
       button.classList.toggle('active', name === this.mode)
@@ -934,6 +992,8 @@ export class ReceiverUI {
   /** Tears everything down. The React wrapper calls this on unmount. */
   async destroy() {
     this.stopDemo()
+    this.scope?.stop()
+    this.scope = undefined
     await this.stop({ keepDemoOff: true })
     this.root.replaceChildren()
   }
