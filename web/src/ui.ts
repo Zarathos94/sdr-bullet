@@ -507,6 +507,23 @@ export class ReceiverUI {
     for (const button of this.displayTabs.querySelectorAll('button')) {
       button.classList.toggle('active', button.dataset['disp'] === mode)
     }
+    this.updateDisplayLoops()
+  }
+
+  /**
+   * Only the display currently on screen should animate. The demo and scope are Canvas2D
+   * rAF loops that each force a layout read per frame; running them while hidden is pure
+   * main-thread churn, and two of them at once is what made the UI feel choppy. The GPU
+   * render loop is left alone — it is cheap and drives the panorama when live.
+   */
+  private updateDisplayLoops() {
+    const demoWrap = this.stage.querySelector('.demo-wrap')
+    const demoShowing =
+      this.displayMode === 'panorama' && demoWrap != null && !demoWrap.classList.contains('hidden')
+    if (demoShowing) this.demo?.start()
+    else this.demo?.stop()
+    if (this.displayMode === 'scope') this.scope?.start()
+    else this.scope?.stop()
   }
 
   // -- Demo ---------------------------------------------------------------
@@ -545,6 +562,7 @@ export class ReceiverUI {
     this.scope?.setSource(null)
     document.querySelector('.demo-wrap')?.classList.remove('hidden')
     this.gpuCanvasWrap.classList.add('hidden')
+    this.updateDisplayLoops()
   }
 
   /**
@@ -556,6 +574,7 @@ export class ReceiverUI {
     this.demo?.setSource(() => this.pipeline.latestSpectrum())
     document.querySelector('.demo-wrap')?.classList.remove('hidden')
     this.gpuCanvasWrap.classList.add('hidden')
+    this.updateDisplayLoops()
   }
 
   private stopDemo() {
@@ -885,7 +904,7 @@ export class ReceiverUI {
           `PLL ${cap ? (cap.locked ? 'lock' : 'unlock') : '—'} · ` +
           `signal ${cap ? cap.powerDbfs.toFixed(1) : '—'} dBFS · ` +
           `pilot ${status.dsp ? status.dsp.pilotLevel.toFixed(4) : '—'} ${status.dsp?.stereo ? 'STEREO' : 'mono'} · ` +
-          `audio-real ${status.dsp ? status.dsp.audioAutocorr.toFixed(2) : '—'} · ` +
+          `audio-mod ${status.dsp ? status.dsp.audioMod.toFixed(2) : '—'} · ` +
           `dropped ${cap ? cap.dropped : '—'} · ` +
           `IQ ring ${status.dsp ? Math.round(status.dsp.ringFill * 100) : 0}% · ` +
           `audio frames ${status.audio.framesDelivered} · underruns ${status.audio.underruns}`,

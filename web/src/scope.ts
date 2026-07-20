@@ -9,6 +9,14 @@
  * does (interleaved I/Q), so it costs nothing extra in the pipeline.
  */
 
+interface Palette {
+  surface: string
+  grid: string
+  zero: string
+  primary: string
+  muted: string
+}
+
 /** Reads an `r g b` design token off the document and returns a CSS colour. */
 function token(name: string, alpha = 1): string {
   const raw = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
@@ -23,6 +31,11 @@ export class ScopeDisplay {
   private width = 0
   private height = 0
   private phase = 0
+  // The design tokens resolved to CSS colours. Read once and refreshed occasionally rather
+  // than every frame: getComputedStyle forces a style recalc, and six of them per frame at
+  // 60 fps is exactly the kind of main-thread churn that makes the whole UI feel choppy.
+  private palette: Palette
+  private paletteAge = 0
   // Interleaved I/Q, newest frame; null before a device is connected.
   private source: (() => Float32Array | null) | null = null
 
@@ -30,7 +43,19 @@ export class ScopeDisplay {
     const ctx = canvas.getContext('2d', { alpha: false })
     if (!ctx) throw new Error('2D canvas context unavailable')
     this.ctx = ctx
+    this.palette = this.readPalette()
     this.resize()
+  }
+
+  /** Resolves the design tokens once. Called from the constructor and refreshed slowly. */
+  private readPalette(): Palette {
+    return {
+      surface: token('--surface'),
+      grid: token('--outline-variant', 0.7),
+      zero: token('--outline', 0.9),
+      primary: token('--primary'),
+      muted: token('--on-surface-variant', 0.85),
+    }
   }
 
   resize(): void {
@@ -66,14 +91,20 @@ export class ScopeDisplay {
     const dpr = Math.min(window.devicePixelRatio || 1, 2)
     const wantW = Math.max(1, Math.round(this.canvas.clientWidth * dpr))
     if (wantW !== this.width && this.canvas.clientWidth > 0) this.resize()
+    // Pick up a light/dark theme switch about once a second, not every frame.
+    if (++this.paletteAge >= 60) {
+      this.paletteAge = 0
+      this.palette = this.readPalette()
+    }
 
     const ctx = this.ctx
     const { width: w, height: h } = this
-    ctx.fillStyle = token('--surface')
+    const pal = this.palette
+    ctx.fillStyle = pal.surface
     ctx.fillRect(0, 0, w, h)
 
     // Graticule.
-    ctx.strokeStyle = token('--outline-variant', 0.7)
+    ctx.strokeStyle = pal.grid
     ctx.lineWidth = 1
     ctx.beginPath()
     for (let i = 1; i < 8; i++) {
@@ -88,7 +119,7 @@ export class ScopeDisplay {
     }
     ctx.stroke()
     // Zero line.
-    ctx.strokeStyle = token('--outline', 0.9)
+    ctx.strokeStyle = pal.zero
     ctx.beginPath()
     ctx.moveTo(0, Math.round(h / 2) + 0.5)
     ctx.lineTo(w, Math.round(h / 2) + 0.5)
@@ -97,12 +128,12 @@ export class ScopeDisplay {
     const iq = this.source ? this.source() : null
     if (iq && iq.length >= 4) {
       // I on the primary colour, Q on the muted variant, so the two are distinguishable.
-      this.trace(iq, 0, token('--primary'), 1.9)
-      this.trace(iq, 1, token('--on-surface-variant', 0.85), 1.4)
+      this.trace(iq, 0, pal.primary, 1.9)
+      this.trace(iq, 1, pal.muted, 1.4)
     } else {
       // Idle: a slow sweep so the scope reads as alive-but-waiting rather than dead.
       this.phase += 0.03
-      ctx.strokeStyle = token('--on-surface-variant', 0.5)
+      ctx.strokeStyle = pal.muted
       ctx.lineWidth = 1.6
       ctx.beginPath()
       for (let x = 0; x < w; x++) {

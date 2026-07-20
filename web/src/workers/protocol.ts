@@ -87,8 +87,12 @@ export interface DspStatus {
   squelchOpen: boolean
   pilotLevel: number
   ringFill: number
-  /** Lag-1 autocorrelation of the demodulated audio: ~0 is noise, near 1 is real program. */
-  audioAutocorr: number
+  /**
+   * Envelope modulation of the demodulated audio — the coefficient of variation of its block
+   * loudness. Near 0 means a flat level (noise/static); above ~0.3 means the swells and
+   * pauses of real program. Distinguishes program from hiss where autocorrelation cannot.
+   */
+  audioMod: number
   rds: {
     synchronised: boolean
     stationName: string

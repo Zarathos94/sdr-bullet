@@ -93,7 +93,13 @@ export class DemoDisplay {
     // check, and only actually resizes on a real change.
     const dpr = Math.min(window.devicePixelRatio || 1, 2)
     const wantW = Math.max(1, Math.round(this.canvas.clientWidth * dpr))
-    if (wantW !== this.width && this.canvas.clientWidth > 0) this.resize()
+    const wantH = Math.max(1, Math.round(this.canvas.clientHeight * dpr))
+    // Heal on either dimension: the display area is a flex cell now, so its height can change
+    // (a tab switch, a resize) while its width does not — and a stale height collapses the
+    // waterfall band. Checking width alone left it mis-sized.
+    if ((wantW !== this.width || wantH !== this.height) && this.canvas.clientWidth > 0) {
+      this.resize()
+    }
 
     if (this.source) {
       const live = this.source()

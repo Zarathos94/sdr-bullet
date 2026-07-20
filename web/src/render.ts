@@ -92,6 +92,17 @@ export async function startRendering(
   const frame = () => {
     if (stopped) return
 
+    // Self-heal the backing-store size. `resize()` ran once at start-up, but the GPU canvases
+    // are configured while still hidden behind the demo (a display:none element measures 0×0),
+    // and relying on the ResizeObserver alone to catch the reveal is fragile — a missed
+    // notification leaves the textures at 1×1 and the waterfall blank. One cheap width check
+    // per frame corrects it the instant the canvas is actually on screen.
+    const dpr = window.devicePixelRatio || 1
+    const liveWidth = targets.waterfall.getBoundingClientRect().width
+    if (liveWidth > 0 && Math.max(1, Math.round(liveWidth * dpr)) !== targets.waterfall.width) {
+      resize()
+    }
+
     // A new spectrum row feeds both the trace and the scrolling waterfall. There may be no
     // new row on a given frame — the display runs faster than the pipeline offers rows —
     // in which case the previous image simply persists.

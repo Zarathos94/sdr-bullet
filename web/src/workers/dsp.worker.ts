@@ -17,7 +17,9 @@ import { MODE_VALUES, type DspConfig, type FromWorker, type ToDsp } from './prot
 
 let stage: ChannelStage | undefined
 let running = false
-let audioAutocorr = 0
+let audioMod = 0
+let blockRmsMean = 0
+let blockRmsVar = 0
 
 function post(message: FromWorker) {
   self.postMessage(message)
@@ -61,19 +63,24 @@ async function start(config: DspConfig) {
       }
       audio.write(interleaved.subarray(0, frames * 2))
 
-      // Is the audio the demod just produced real program, or noise? Lag-1 autocorrelation
-      // separates them: band-limited speech/music is strongly correlated sample-to-sample
-      // (~0.7+), white static is near 0. Smoothed so it reads steadily.
-      if (frames > 16) {
-        let mean = 0
-        for (let k = 0; k < frames; k++) mean += left[k]!
-        mean /= frames
-        let num = 0
-        let den = 0
-        for (let k = 1; k < frames; k++) num += (left[k]! - mean) * (left[k - 1]! - mean)
-        for (let k = 0; k < frames; k++) den += (left[k]! - mean) * (left[k]! - mean)
-        const ac = den > 1e-9 ? num / den : 0
-        audioAutocorr += 0.2 * (ac - audioAutocorr)
+      // Is the audio the demod just produced real program, or noise? Envelope modulation is
+      // the discriminator: real speech/music swells and pauses, so its loudness varies a lot
+      // block to block; band-limited static sits at a near-constant level. The coefficient of
+      // variation of the block RMS captures that — and unlike lag-1 autocorrelation it is not
+      // dominated by the de-emphasis low-pass (which is why the old "audio-real" read a flat
+      // ~0.85 for both program and hiss). Near 0 = flat (noise); above ~0.3 = real program.
+      if (frames > 64) {
+        let energy = 0
+        for (let k = 0; k < frames; k++) {
+          const v = left[k]!
+          energy += v * v
+        }
+        const rms = Math.sqrt(energy / frames)
+        const a = 0.05
+        blockRmsMean += a * (rms - blockRmsMean)
+        const dev = rms - blockRmsMean
+        blockRmsVar += a * (dev * dev - blockRmsVar)
+        audioMod = blockRmsMean > 1e-6 ? Math.sqrt(Math.max(0, blockRmsVar)) / blockRmsMean : 0
       }
     }
 
@@ -85,7 +92,7 @@ async function start(config: DspConfig) {
         squelchOpen: stage.squelch_open(),
         pilotLevel: stage.pilot_level(),
         ringFill: iq.fill(),
-        audioAutocorr,
+        audioMod,
         rds: {
           synchronised: stage.rds_synchronised(),
           stationName: stage.rds_station_name(),
