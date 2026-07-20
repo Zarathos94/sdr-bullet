@@ -66,12 +66,15 @@ export class Pipeline {
   private constellationSource: LatestFrame | undefined
   private readonly bins = new Float32Array(FFT_SIZE)
   private readonly constellationFrame = new Float32Array(FFT_SIZE * 2)
+  private readonly peekBins = new Float32Array(FFT_SIZE)
 
   private device: DeviceIdentity | undefined
   private simdBackend = 'unknown'
   private captureStatus: CaptureStatus | undefined
   private dspStatus: DspStatus | undefined
   private running = false
+  private tunedHz = 0
+  private actualSampleRate = CAPTURE_RATE
 
   private statusListener: StatusListener | undefined
   private errorListener: ErrorListener | undefined
@@ -120,6 +123,7 @@ export class Pipeline {
    */
   async start(centreHz: number, mode: DemodModeName, gainTenths = -1): Promise<void> {
     if (this.running) await this.stop()
+    this.tunedHz = centreHz
 
     const iq = allocateIqRing(IQ_RING_CAPACITY)
     const audioRing = allocateRing(AUDIO_RING_CAPACITY)
@@ -199,8 +203,14 @@ export class Pipeline {
         if (message.fatal) void this.stop()
         break
       case 'status':
-        if (source === 'capture') this.captureStatus = message as CaptureStatus
-        else this.dspStatus = message as DspStatus
+        if (source === 'capture') {
+          const capture = message as CaptureStatus
+          this.captureStatus = capture
+          this.tunedHz = capture.tunedHz
+          this.actualSampleRate = capture.sampleRate
+        } else {
+          this.dspStatus = message as DspStatus
+        }
         break
     }
     this.statusListener?.(this.status())
@@ -210,6 +220,29 @@ export class Pipeline {
   latestSpectrum(): Float32Array | null {
     if (!this.spectrumSink) return null
     return this.spectrumSink.consume(this.bins) ? this.bins : null
+  }
+
+  /**
+   * The newest spectrum row without consuming it — dB bins in display order, lowest
+   * frequency first. The scanner reads this while the render loop keeps consuming normally.
+   */
+  peekSpectrum(): Float32Array | null {
+    if (!this.spectrumSink) return null
+    return this.spectrumSink.peek(this.peekBins) ? this.peekBins : null
+  }
+
+  /** Number of spectrum bins, i.e. the span of a peeked row across the sample rate. */
+  get spectrumBins(): number {
+    return FFT_SIZE
+  }
+
+  /** The rate actually achieved, so a bin index maps to an absolute frequency. */
+  get sampleRate(): number {
+    return this.actualSampleRate
+  }
+
+  get currentFrequency(): number {
+    return this.tunedHz
   }
 
   /**
@@ -227,6 +260,7 @@ export class Pipeline {
   }
 
   tune(hz: number): void {
+    this.tunedHz = hz
     if (this.capture) this.post<ToCapture>(this.capture, { type: 'tune', hz })
   }
 

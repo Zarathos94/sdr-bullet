@@ -287,6 +287,21 @@ export class LatestFrame {
     return true
   }
 
+  /**
+   * Copies the newest frame without advancing the read cursor, so a second reader (the
+   * scanner reading the spectrum the render loop is already consuming) can look at it too.
+   * Returns false only before the first frame is ever published.
+   *
+   * Safe against a concurrent `publish`: the writer always targets the other of the two
+   * slots, so the slot read here is not the one being written.
+   */
+  peek(out: Float32Array): boolean {
+    const sequence = Atomics.load(this.header, Slot.Write)
+    if (sequence === 0) return false
+    out.set(this.slots[sequence & 1]!.subarray(0, Math.min(out.length, this.frameLength)))
+    return true
+  }
+
   get buffer(): SharedArrayBuffer {
     return this.sab
   }
