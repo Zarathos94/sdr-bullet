@@ -459,8 +459,9 @@ export class ReceiverUI {
 
   // -- Demo ---------------------------------------------------------------
 
-  private startDemo() {
-    if (this.running) return
+  /** Creates and starts the 2D canvas display if it does not exist yet. */
+  private ensureDemo() {
+    if (this.demo) return
     try {
       this.demo = new DemoDisplay(this.demoCanvas)
       this.demo.start()
@@ -469,6 +470,24 @@ export class ReceiverUI {
     } catch {
       // A missing 2D context is not worth failing the whole app over.
     }
+  }
+
+  /** The synthetic pre-connect demo. */
+  private startDemo() {
+    if (this.running) return
+    this.ensureDemo()
+    this.demo?.setSource(null)
+    document.querySelector('.demo-wrap')?.classList.remove('hidden')
+    this.gpuCanvasWrap.classList.add('hidden')
+  }
+
+  /**
+   * The live 2D spectrum shown when WebGPU is unavailable or drops out — the same canvas as
+   * the demo, but fed the real spectrum so the receiver still has a working display.
+   */
+  private startLiveFallback() {
+    this.ensureDemo()
+    this.demo?.setSource(() => this.pipeline.latestSpectrum())
     document.querySelector('.demo-wrap')?.classList.remove('hidden')
     this.gpuCanvasWrap.classList.add('hidden')
   }
@@ -480,6 +499,15 @@ export class ReceiverUI {
     this.demoResizeObserver = undefined
     document.querySelector('.demo-wrap')?.classList.add('hidden')
     this.gpuCanvasWrap.classList.remove('hidden')
+  }
+
+  /** WebGPU dropped out after start-up; switch the displays to the live 2D fallback. */
+  private onGpuLost() {
+    if (!this.running) return
+    this.render?.stop()
+    this.render = undefined
+    this.startLiveFallback()
+    this.showNotice('The GPU dropped out — switched to a 2D spectrum. Audio is unaffected.', false)
   }
 
   // -- Tuning -------------------------------------------------------------
@@ -718,26 +746,34 @@ export class ReceiverUI {
       this.pipeline.setAgc(defaults.agc)
       if (this.mode === 'wfm') this.pipeline.setDeemphasis(DEFAULT_DEEMPHASIS_US)
 
-      this.stopDemo()
-
-      // The displays are optional and must never take the receiver down with them. WebGPU
-      // can be absent or, embedded in a cross-origin-isolated iframe, throw while setting up
-      // a context — and until now that threw straight into the catch below, which stops the
-      // pipeline and, mid-initialisation, cancels the device's own control transfers ("the
-      // transfer was cancelled"), leaving no audio. Audio and capture are already running by
-      // this point, so a rendering failure is isolated here: the waterfall goes dark, the
-      // radio keeps playing.
-      try {
-        this.render = await startRendering(this.pipeline, this.canvases)
-        if (!this.render.usingGpu) this.showNotice(this.render.adapterInfo, false)
-      } catch (error) {
-        this.render = undefined
-        console.warn('sdr-bullet: displays unavailable', error)
-        this.showNotice('The GPU displays could not start here — audio is unaffected.', false)
-      }
-
+      // Audio and capture are live now. The displays are optional and must never take the
+      // receiver down: mark it live before touching the GPU so a display failure is isolated.
       this.running = true
       this.setConnectionUi('live')
+
+      // Try WebGPU; if it is unavailable or throws — common for WebGPU on Linux inside this
+      // cross-origin-isolated frame, where the Vulkan external-semaphore share fails — fall
+      // back to a live 2D spectrum on the demo canvas so the receiver still has a display.
+      let gpuOk = false
+      try {
+        this.render = await startRendering(this.pipeline, this.canvases, () => this.onGpuLost())
+        gpuOk = this.render.usingGpu
+      } catch (error) {
+        this.render = undefined
+        console.warn('sdr-bullet: WebGPU displays unavailable', error)
+      }
+
+      if (gpuOk) {
+        this.stopDemo()
+      } else {
+        this.render?.stop()
+        this.render = undefined
+        this.startLiveFallback()
+        this.showNotice(
+          'WebGPU is unavailable here — showing a 2D spectrum. Audio is full quality.',
+          false,
+        )
+      }
     } catch (error) {
       this.onError(error instanceof Error ? error.message : String(error), true)
       await this.stop()

@@ -37,8 +37,12 @@ export interface RenderHandle {
 export async function startRendering(
   pipeline: Pipeline,
   targets: RenderTargets,
+  onDeviceLost?: () => void,
 ): Promise<RenderHandle> {
-  const device = await acquireDevice()
+  // A GPU that is lost after start-up — common for WebGPU on Linux inside a sandboxed,
+  // cross-origin-isolated frame, where the Vulkan external-semaphore share can fail — is
+  // reported so the caller can fall back to the 2D displays rather than freeze.
+  const device = await acquireDevice(onDeviceLost ? { onLost: () => onDeviceLost() } : undefined)
 
   if (!device) {
     return {
@@ -113,9 +117,16 @@ export async function startRendering(
       constellation.pushSamples(iScratch, qScratch)
     }
 
-    spectrum.render()
-    waterfall.render()
-    constellation.render()
+    try {
+      spectrum.render()
+      waterfall.render()
+      constellation.render()
+    } catch {
+      // A device lost mid-frame throws here. Stop the loop; the onLost callback passed to
+      // acquireDevice drives the switch to the 2D fallback.
+      stopped = true
+      return
+    }
 
     raf = requestAnimationFrame(frame)
   }
@@ -126,9 +137,13 @@ export async function startRendering(
       stopped = true
       cancelAnimationFrame(raf)
       observer.disconnect()
-      waterfall.dispose()
-      spectrum.dispose()
-      constellation.dispose()
+      try {
+        waterfall.dispose()
+        spectrum.dispose()
+        constellation.dispose()
+      } catch {
+        // Disposing GPU resources on an already-lost device can throw; nothing to do.
+      }
     },
     usingGpu: true,
     adapterInfo,

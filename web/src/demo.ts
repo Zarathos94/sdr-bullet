@@ -42,6 +42,13 @@ export class DemoDisplay {
   private width = 0
   private height = 0
   private waterfallTop = 0
+  // Colormap range. Fixed for the synthetic demo; eased toward the live signal's own range
+  // when a source is attached, since a real receiver's dB scale is not known in advance.
+  private floorDb = FLOOR_DB
+  private ceilDb = CEIL_DB
+  // When set, the display draws this live spectrum (dB bins, lowest frequency first) instead
+  // of the synthetic demo — the 2D fallback used when WebGPU is unavailable.
+  private source: (() => Float32Array | null) | null = null
 
   constructor(private readonly canvas: HTMLCanvasElement) {
     const ctx = canvas.getContext('2d', { alpha: false })
@@ -88,10 +95,51 @@ export class DemoDisplay {
     const wantW = Math.max(1, Math.round(this.canvas.clientWidth * dpr))
     if (wantW !== this.width && this.canvas.clientWidth > 0) this.resize()
 
-    const t = (performance.now() - this.startTime) / 1000
-    this.generate(t)
+    if (this.source) {
+      const live = this.source()
+      if (live && live.length > 0) this.ingestLive(live)
+      // No new frame: keep the previous row so the waterfall holds rather than flickers.
+    } else {
+      const t = (performance.now() - this.startTime) / 1000
+      this.generate(t)
+    }
     this.drawWaterfallRow()
     this.drawSpectrum()
+  }
+
+  /**
+   * Draws a live spectrum instead of the synthetic one — the 2D fallback for when WebGPU is
+   * unavailable or has dropped out. Passing null returns to the synthetic demo.
+   */
+  setSource(source: (() => Float32Array | null) | null): void {
+    this.source = source
+    if (source) {
+      // Start from the live scale rather than the synthetic floor/ceiling.
+      this.floorDb = -60
+      this.ceilDb = 0
+    } else {
+      this.floorDb = FLOOR_DB
+      this.ceilDb = CEIL_DB
+    }
+  }
+
+  /** Resamples a live dB spectrum into the display width and eases the colormap range to it. */
+  private ingestLive(live: Float32Array): void {
+    const n = live.length
+    let min = Infinity
+    let max = -Infinity
+    for (let k = 0; k < BINS; k++) {
+      const db = live[Math.min(n - 1, ((k * n) / BINS) | 0)]!
+      this.spectrum[k] = db
+      if (db < min) min = db
+      if (db > max) max = db
+    }
+    if (Number.isFinite(min) && Number.isFinite(max) && max > min + 1) {
+      // Ease toward the signal's own range (with a little headroom) so the colours stay
+      // stable frame to frame instead of strobing with the noise floor.
+      this.floorDb += 0.08 * (min - 2 - this.floorDb)
+      this.ceilDb += 0.08 * (max + 4 - this.ceilDb)
+    }
   }
 
   /** Fills `spectrum` with a synthetic band: noise floor plus the drifting carriers. */
@@ -134,7 +182,7 @@ export class DemoDisplay {
     const row = ctx.createImageData(width, 1)
     for (let px = 0; px < width; px++) {
       const db = this.spectrum[Math.floor((px / width) * BINS)]!
-      const [r, g, b] = colormap((db - FLOOR_DB) / (CEIL_DB - FLOOR_DB))
+      const [r, g, b] = colormap((db - this.floorDb) / (this.ceilDb - this.floorDb))
       const o = px * 4
       row.data[o] = r
       row.data[o + 1] = g
@@ -164,7 +212,7 @@ export class DemoDisplay {
     ctx.beginPath()
     for (let px = 0; px < width; px++) {
       const db = this.spectrum[Math.floor((px / width) * BINS)]!
-      const norm = clamp01((db - FLOOR_DB) / (CEIL_DB - FLOOR_DB))
+      const norm = clamp01((db - this.floorDb) / (this.ceilDb - this.floorDb))
       const y = h - norm * (h - 4) - 2
       if (px === 0) ctx.moveTo(px, y)
       else ctx.lineTo(px, y)
