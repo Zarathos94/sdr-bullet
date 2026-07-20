@@ -70,38 +70,54 @@ export async function acquireDevice(options?: AcquireOptions): Promise<GPUDevice
   const gpu: GPU | undefined = typeof navigator === 'undefined' ? undefined : navigator.gpu
   if (!gpu) return null
 
-  // High performance because a waterfall wants the discrete GPU on a laptop that has one;
-  // the power cost is irrelevant next to a receiver that is already driving a USB radio.
-  const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' })
-  if (!adapter) return null
+  // Ask for the discrete GPU first (a waterfall wants it and the power cost is irrelevant
+  // next to driving a USB radio), then fall through to the integrated GPU, then to whatever
+  // the browser prefers. On a hybrid-graphics laptop the "high-performance" adapter can be
+  // the one with a broken or missing driver — a brand-new dGPU whose kernel driver is not up
+  // yet, for instance — while the integrated GPU works fine. Forcing high-performance and
+  // giving up on the first dead adapter is what leaves such a machine with "no available
+  // adapters"; trying the others rescues WebGPU instead of dropping straight to the 2D path.
+  const preferences: (GPURequestAdapterOptions | undefined)[] = [
+    { powerPreference: 'high-performance' },
+    { powerPreference: 'low-power' },
+    undefined,
+  ]
 
-  let device: GPUDevice
-  try {
-    // No required features or limits: everything the renderers use — r32float storage
-    // textures, storage-buffer atomics, compute — is core, so asking for nothing keeps the
-    // widest device compatibility.
-    device = await adapter.requestDevice()
-  } catch {
-    return null
+  const tried = new Set<GPUAdapter>()
+  for (const preference of preferences) {
+    const adapter = await gpu.requestAdapter(preference)
+    // Skip a null result or an adapter already tried (the preferences can resolve to the
+    // same physical device on a single-GPU machine).
+    if (!adapter || tried.has(adapter)) continue
+    tried.add(adapter)
+
+    let device: GPUDevice
+    try {
+      // No required features or limits: everything the renderers use — r32float storage
+      // textures, storage-buffer atomics, compute — is core, so asking for nothing keeps the
+      // widest device compatibility.
+      device = await adapter.requestDevice()
+    } catch {
+      continue
+    }
+
+    // Race the lost promise against a resolved sentinel: if the device died during creation
+    // the lost promise is already settled and this observes it synchronously-enough to reject
+    // the device before returning — so a dead adapter falls through to the next preference.
+    const bornLost = await Promise.race([device.lost.then((info) => info), Promise.resolve(null)])
+    if (bornLost && bornLost.reason !== 'destroyed') continue
+
+    adapters.set(device, adapter)
+
+    // Surface a later, genuine loss. `destroyed` is the caller's own dispose and is not a fault.
+    void device.lost.then((info) => {
+      if (info.reason === 'destroyed') return
+      if (options?.onLost) options.onLost(info)
+      else console.warn(`WebGPU device lost: ${info.message || info.reason}`)
+    })
+
+    return device
   }
 
-  // Race the lost promise against a resolved sentinel: if the device died during creation
-  // the lost promise is already settled and this observes it synchronously-enough to reject
-  // the device before returning.
-  const bornLost = await Promise.race([
-    device.lost.then((info) => info),
-    Promise.resolve(null),
-  ])
-  if (bornLost && bornLost.reason !== 'destroyed') return null
-
-  adapters.set(device, adapter)
-
-  // Surface a later, genuine loss. `destroyed` is the caller's own dispose and is not a fault.
-  void device.lost.then((info) => {
-    if (info.reason === 'destroyed') return
-    if (options?.onLost) options.onLost(info)
-    else console.warn(`WebGPU device lost: ${info.message || info.reason}`)
-  })
-
-  return device
+  return null
 }
