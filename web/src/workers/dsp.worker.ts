@@ -26,8 +26,6 @@ async function start(config: DspConfig) {
   const { memory } = await loadWasm()
 
   stage = new ChannelStage(config.sampleRate, config.blockSize, MODE_VALUES[config.mode])
-  const inputI = floatView(memory, stage.i_ptr(), stage.input_capacity())
-  const inputQ = floatView(memory, stage.q_ptr(), stage.input_capacity())
 
   const iq = new IqConsumer(config.iq)
   const audio = new RingProducer(config.audio)
@@ -42,6 +40,13 @@ async function start(config: DspConfig) {
   while (running) {
     if (!iq.waitFor(config.blockSize, 100)) continue
 
+    // Re-view the wasm input buffers every pass. A typed array over the wasm memory detaches
+    // the instant that memory grows — and a lazy allocation inside the demod chain grows it
+    // on the first process() — after which a cached view has length 0, so the read below
+    // silently takes nothing and the audio stops dead after one block. Re-creating the view
+    // over the current buffer each iteration is cheap and immune to that.
+    const inputI = floatView(memory, stage.i_ptr(), stage.input_capacity())
+    const inputQ = floatView(memory, stage.q_ptr(), stage.input_capacity())
     const samples = iq.read(inputI, inputQ)
     if (samples === 0) continue
 

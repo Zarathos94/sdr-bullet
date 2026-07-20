@@ -55,9 +55,7 @@ async function start(config: CaptureConfig) {
   await receiver.setFrequency(config.centreHz)
   await receiver.resetBuffer()
 
-  // Constructed before any view is built, because its allocations would detach them.
   const stage = new CaptureStage(MAX_TRANSFER_BYTES)
-  const rawInput = byteView(memory, stage.input_ptr(), stage.input_capacity())
 
   const iq = new IqProducer(config.iq)
   const spectrum = new LatestFrame(config.spectrum, config.spectrumFrameLength)
@@ -108,6 +106,10 @@ async function start(config: CaptureConfig) {
       continue
     }
 
+    // Re-view the wasm input buffer each pass: a cached typed array over the wasm memory
+    // detaches the moment that memory grows, and reads/writes through a detached view are
+    // silently dropped. Re-creating it over the current buffer is cheap and immune.
+    const rawInput = byteView(memory, stage.input_ptr(), stage.input_capacity())
     const usable = Math.min(block.length, rawInput.length)
     rawInput.set(block.subarray(0, usable))
     const samples = stage.process(usable)

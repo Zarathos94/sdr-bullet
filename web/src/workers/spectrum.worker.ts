@@ -38,9 +38,6 @@ async function start(config: SpectrumConfig) {
   const { memory } = await loadWasm()
 
   stage = new SpectrumStage(config.fftSize)
-  const re = floatView(memory, stage.i_ptr(), config.fftSize)
-  const im = floatView(memory, stage.q_ptr(), config.fftSize)
-  const bins = floatView(memory, stage.bins_ptr(), config.fftSize)
 
   const source = new LatestFrame(config.source, config.fftSize * 2)
   const sink = new LatestFrame(config.sink, config.fftSize)
@@ -51,12 +48,16 @@ async function start(config: SpectrumConfig) {
 
   while (running) {
     if (source.consume(interleaved)) {
+      // Re-view the wasm buffers each pass: a cached view detaches when the wasm memory
+      // grows, after which writes and reads through it are silently dropped.
+      const re = floatView(memory, stage.i_ptr(), config.fftSize)
+      const im = floatView(memory, stage.q_ptr(), config.fftSize)
       for (let k = 0; k < config.fftSize; k++) {
         re[k] = interleaved[k * 2]!
         im[k] = interleaved[k * 2 + 1]!
       }
       stage.process()
-      sink.publish(bins)
+      sink.publish(floatView(memory, stage.bins_ptr(), config.fftSize))
     }
 
     // A plain sleep, since there is nothing to block on — the source slot has no notify,
