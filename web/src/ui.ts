@@ -112,7 +112,9 @@ export class ReceiverUI {
 
   // Shared DOM references.
   private readonly diagnostics = el('div', 'diagnostics')
-  private readonly connectButton = el('button', 'primary', 'Connect receiver')
+  private readonly connectButton = el('button', 'primary connect-btn', 'Connect receiver')
+  private readonly statusDot = el('span', 'status-dot')
+  private readonly statusText = el('span', 'status-text', 'Offline')
   private readonly noticeArea = el('div')
   private readonly radioView = el('div', 'view radio-view')
   private readonly spectrumView = el('div', 'view spectrum-view')
@@ -155,18 +157,22 @@ export class ReceiverUI {
   private build() {
     this.root.replaceChildren()
 
+    // Top action bar: identity on the left, the primary Connect action and a live-status
+    // pill on the right, so the one thing a first-time visitor must do is always in view
+    // and unmistakable rather than buried among the controls.
     const header = el('div', 'header')
-    const title = el('div')
+    const title = el('div', 'brand')
     title.append(el('h1', undefined, 'sdr-bullet'))
-    title.append(
-      el(
-        'div',
-        'tagline',
-        'WebUSB to the dongle · Rust and WebAssembly for the DSP · the waterfall on the GPU',
-      ),
-    )
-    header.append(title, this.diagnostics)
+    title.append(el('div', 'tagline', 'A software radio in the browser · WebUSB · Rust/WASM · GPU'))
+
+    const actions = el('div', 'topbar-actions')
+    const statusPill = el('div', 'status-pill')
+    statusPill.append(this.statusDot, this.statusText)
+    actions.append(statusPill, this.connectButton)
+
+    header.append(title, actions)
     this.root.append(header)
+    this.root.classList.add('offline')
 
     const capability = Pipeline.capabilities()
     if (!capability.ok) {
@@ -184,6 +190,10 @@ export class ReceiverUI {
     this.buildSpectrumView()
     this.root.append(this.radioView)
     this.root.append(this.spectrumView)
+
+    const footer = el('div', 'app-footer')
+    footer.append(this.diagnostics)
+    this.root.append(footer)
 
     this.setView('radio')
     this.updateRadioDisplay()
@@ -230,7 +240,9 @@ export class ReceiverUI {
     // The demo overlay sits on top and covers the displays until we go live.
     const demoWrap = el('div', 'canvas-wrap demo-wrap')
     demoWrap.append(this.demoCanvas)
-    demoWrap.append(el('div', 'canvas-label', 'Demo signal — connect a receiver for live data'))
+    demoWrap.append(
+      el('div', 'canvas-label', 'Demo signal · press Connect (top right) for live reception'),
+    )
 
     displays.append(this.gpuCanvasWrap)
     displays.append(demoWrap)
@@ -306,7 +318,6 @@ export class ReceiverUI {
     volumeRow.append(volume)
     dial.append(volumeRow)
 
-    dial.append(this.connectButton)
     this.radioView.append(dial)
 
     // Presets.
@@ -682,10 +693,21 @@ export class ReceiverUI {
     else await this.startPipeline()
   }
 
+  /** Reflects the connection state across the header pill, the button, and the root class. */
+  private setConnectionUi(state: 'offline' | 'connecting' | 'live') {
+    this.root.classList.toggle('offline', state === 'offline')
+    this.root.classList.toggle('connecting', state === 'connecting')
+    this.root.classList.toggle('live', state === 'live')
+    this.statusText.textContent =
+      state === 'live' ? 'Live' : state === 'connecting' ? 'Connecting' : 'Offline'
+    this.connectButton.textContent =
+      state === 'live' ? 'Disconnect' : state === 'connecting' ? 'Connecting…' : 'Connect receiver'
+    this.connectButton.disabled = state === 'connecting'
+  }
+
   private async startPipeline() {
     this.clearNotice()
-    this.connectButton.disabled = true
-    this.connectButton.textContent = 'Connecting…'
+    this.setConnectionUi('connecting')
 
     try {
       await this.pipeline.requestDevice()
@@ -715,12 +737,12 @@ export class ReceiverUI {
       }
 
       this.running = true
-      this.connectButton.textContent = 'Disconnect'
+      this.setConnectionUi('live')
     } catch (error) {
       this.onError(error instanceof Error ? error.message : String(error), true)
       await this.stop()
     } finally {
-      this.connectButton.disabled = false
+      if (!this.running) this.setConnectionUi('offline')
     }
   }
 
@@ -736,7 +758,7 @@ export class ReceiverUI {
     this.render = undefined
     await this.pipeline.stop()
     this.running = false
-    this.connectButton.textContent = 'Connect receiver'
+    this.setConnectionUi('offline')
     if (!options.keepDemoOff) this.startDemo()
   }
 
