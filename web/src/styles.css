@@ -86,6 +86,9 @@ body {
 }
 
 .displays {
+  display: block;
+}
+.gpu-displays {
   display: grid;
   grid-template-columns: 1fr;
   gap: 1rem;
@@ -323,11 +326,265 @@ select {
 }
 
 @media (min-width: 900px) {
-  .displays {
+  .gpu-displays {
     grid-template-columns: 3fr 1fr;
   }
   .constellation-wrap {
     height: 100%;
     min-height: 200px;
   }
+}
+
+/* ── View toggle (Radio / Spectrum) ─────────────────────────────────────── */
+.view-toggle {
+  display: inline-flex;
+  gap: 2px;
+  border: 1px solid rgb(var(--outline-variant));
+  width: max-content;
+}
+.view-toggle button {
+  border: none;
+  padding: 0.4rem 1.1rem;
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  font-weight: 600;
+  background: rgb(var(--surface-container));
+  color: rgb(var(--on-surface-variant));
+}
+.view-toggle button.active {
+  background: rgb(var(--primary));
+  color: rgb(var(--on-primary));
+}
+
+.view.hidden,
+.demo-wrap.hidden,
+.gpu-displays.hidden {
+  display: none;
+}
+
+/* ── Demo overlay ───────────────────────────────────────────────────────── */
+.demo-wrap {
+  height: 504px;
+  position: relative;
+}
+.demo-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ── Radio view ─────────────────────────────────────────────────────────── */
+.radio-view {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 900px) {
+  .radio-view {
+    grid-template-columns: 1.4fr 1fr;
+    align-items: start;
+  }
+  .radio-dial {
+    grid-row: span 2;
+  }
+}
+
+.radio-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.radio-bandrow {
+  display: inline-flex;
+  gap: 2px;
+}
+.radio-bandrow button {
+  padding: 0.35rem 1rem;
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+.radio-bandrow button.active {
+  background: rgb(var(--primary-fixed, var(--primary)));
+  color: rgb(var(--on-primary));
+  border-color: rgb(var(--primary-fixed, var(--primary)));
+}
+
+.radio-freq-wrap {
+  text-align: center;
+  padding: 1rem 0 0.25rem;
+}
+.radio-freq {
+  font-family: var(--mono);
+  font-size: clamp(2.6rem, 9vw, 4.2rem);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  cursor: ns-resize;
+  user-select: none;
+  outline: none;
+}
+.radio-freq:focus-visible {
+  color: rgb(var(--primary-fixed, var(--primary)));
+}
+.radio-freq .radio-unit {
+  font-size: 0.3em;
+  margin-left: 0.4rem;
+  color: rgb(var(--on-surface-variant));
+}
+.radio-band {
+  display: block;
+  margin-top: 0.35rem;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.1em;
+  color: rgb(var(--on-surface-variant));
+  text-transform: uppercase;
+}
+
+.radio-transport {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 2px;
+  margin: 0.75rem 0;
+}
+.radio-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.6rem;
+}
+.radio-btn .material-symbols-outlined {
+  font-size: 22px;
+}
+
+.meter {
+  height: 8px;
+  background: rgb(var(--surface));
+  border: 1px solid rgb(var(--outline-variant));
+  overflow: hidden;
+}
+.meter-fill {
+  height: 100%;
+  width: 0%;
+  background: rgb(var(--success));
+  transition: width 0.2s ease;
+}
+
+.radio-rds {
+  text-align: center;
+  margin: 0.75rem 0;
+  min-height: 3.2em;
+}
+.radio-name {
+  font-family: var(--mono);
+  font-size: 1.4rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  min-height: 1.4em;
+}
+.radio-text {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: rgb(var(--on-surface-variant));
+  min-height: 1.4em;
+  word-break: break-word;
+}
+
+/* ── Presets ────────────────────────────────────────────────────────────── */
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2px;
+}
+.preset-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  padding: 0.5rem 0.6rem;
+  min-height: 3rem;
+}
+.preset-slot.empty {
+  color: rgb(var(--on-surface-variant));
+  opacity: 0.6;
+}
+.preset-num {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  color: rgb(var(--on-surface-variant));
+}
+.preset-freq {
+  font-family: var(--mono);
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+.preset-empty {
+  font-size: 0.75rem;
+}
+.hint {
+  margin-top: 0.5rem;
+  font-size: 0.7rem;
+  color: rgb(var(--on-surface-variant));
+}
+
+/* ── Station catalogue ──────────────────────────────────────────────────── */
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.panel-header h2 {
+  margin: 0;
+}
+.panel-header button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  overflow: hidden;
+}
+.panel-header button .material-symbols-outlined {
+  font-size: 16px;
+}
+.panel-header button.scanning {
+  border-color: rgb(var(--primary-fixed, var(--primary)));
+}
+.panel-header button.scanning::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: var(--scan-progress, 0%);
+  background: rgb(var(--primary-fixed, var(--primary)));
+  transition: width 0.2s linear;
+}
+
+.station-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 0.6rem;
+  max-height: 340px;
+  overflow-y: auto;
+}
+.station-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.45rem 0.7rem;
+  font-family: var(--mono);
+}
+.station-freq {
+  font-size: 0.95rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.station-strength {
+  color: rgb(var(--success));
+  letter-spacing: 0.15em;
 }
