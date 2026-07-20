@@ -816,8 +816,10 @@ export class ReceiverUI {
       const cap = status.capture
       console.info(
         `[sdr] throughput ${cap ? (cap.bytesPerSecond / 1e6).toFixed(2) : '—'} MB/s · ` +
+          `tuned ${cap ? (cap.tunedHz / 1e6).toFixed(3) : '—'} MHz · ` +
           `PLL ${cap ? (cap.locked ? 'lock' : 'unlock') : '—'} · ` +
           `signal ${cap ? cap.powerDbfs.toFixed(1) : '—'} dBFS · ` +
+          `pilot ${status.dsp ? status.dsp.pilotLevel.toFixed(4) : '—'} ${status.dsp?.stereo ? 'STEREO' : 'mono'} · ` +
           `dropped ${cap ? cap.dropped : '—'} · ` +
           `IQ ring ${status.dsp ? Math.round(status.dsp.ringFill * 100) : 0}% · ` +
           `audio frames ${status.audio.framesDelivered} · underruns ${status.audio.underruns}`,
