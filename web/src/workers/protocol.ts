@@ -77,6 +77,8 @@ export interface CaptureStatus {
   /** Samples discarded because a downstream stage could not keep up. */
   dropped: number
   bytesPerSecond: number
+  /** Mean power of the raw capture in dBFS — high means real signal, low means noise floor. */
+  powerDbfs: number
 }
 
 export interface DspStatus {

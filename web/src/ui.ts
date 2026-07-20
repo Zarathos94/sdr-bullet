@@ -817,6 +817,8 @@ export class ReceiverUI {
       console.info(
         `[sdr] throughput ${cap ? (cap.bytesPerSecond / 1e6).toFixed(2) : '—'} MB/s · ` +
           `PLL ${cap ? (cap.locked ? 'lock' : 'unlock') : '—'} · ` +
+          `signal ${cap ? cap.powerDbfs.toFixed(1) : '—'} dBFS · ` +
+          `dropped ${cap ? cap.dropped : '—'} · ` +
           `IQ ring ${status.dsp ? Math.round(status.dsp.ringFill * 100) : 0}% · ` +
           `audio frames ${status.audio.framesDelivered} · underruns ${status.audio.underruns}`,
       )
@@ -840,8 +842,13 @@ export class ReceiverUI {
       rows.push(['Tuned', formatFrequency(status.capture.tunedHz).value + ' MHz'])
       rows.push(['Band', status.capture.band])
       rows.push(['PLL', status.capture.locked ? 'locked' : 'unlocked'])
+      rows.push(['Signal', `${status.capture.powerDbfs.toFixed(1)} dBFS`])
       rows.push(['Throughput', `${(status.capture.bytesPerSecond / 1e6).toFixed(1)} MB/s`])
       if (status.capture.dropped > 0) rows.push(['Dropped', String(status.capture.dropped)])
+      // Radio-view strength meter from the real capture power: a noise floor sits near
+      // -55 dBFS, a strong local station near -10, so map that span onto the bar.
+      const strength = Math.max(0, Math.min(1, (status.capture.powerDbfs + 55) / 50))
+      this.signalBar.style.width = `${Math.round(strength * 100)}%`
     }
     if (status.dsp) {
       rows.push(['Stereo', status.dsp.stereo ? 'yes' : 'no'])

@@ -43,6 +43,23 @@ function post(message: FromWorker) {
   self.postMessage(message)
 }
 
+/**
+ * Mean power of a raw 8-bit IQ block in dBFS — the single most useful sign of life. A live
+ * antenna on a real station reads well above the floor (tens of dB); a mistuned or dead
+ * capture sits near it. It is the fastest way to tell "no signal" from "signal, wrong maths".
+ */
+function rawPowerDbfs(block: Uint8Array): number {
+  const n = block.length & ~1
+  if (n === 0) return -120
+  let sum = 0
+  for (let k = 0; k < n; k += 2) {
+    const i = (block[k]! - 127.5) / 127.5
+    const q = (block[k + 1]! - 127.5) / 127.5
+    sum += i * i + q * q
+  }
+  return 10 * Math.log10(Math.max(sum / (n / 2), 1e-20))
+}
+
 async function start(config: CaptureConfig) {
   const { memory } = await loadWasm()
   post({ type: 'ready', simdBackend: simd_backend() })
@@ -152,6 +169,7 @@ async function start(config: CaptureConfig) {
         locked: await receiver.isLocked(),
         dropped: iq.dropped(),
         bytesPerSecond: bytesSinceReport / elapsed,
+        powerDbfs: rawPowerDbfs(block.subarray(0, usable)),
       })
       bytesSinceReport = 0
       lastReport = now
