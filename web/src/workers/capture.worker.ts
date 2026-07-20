@@ -26,6 +26,19 @@ let transport: UsbTransport | undefined
 let receiver: Receiver | undefined
 let running = false
 
+/**
+ * Control operations (retune, gain, bias-tee, …) waiting to run against the device.
+ *
+ * They cannot run the moment their message arrives: the sample stream keeps several bulk
+ * transfers in flight, and a control write that lands among them — especially the buffer
+ * reset a retune performs, which flushes the endpoint FIFO — cancels those transfers. The
+ * read loop then sees the cancellation, treats it as fatal, and closes the device, which in
+ * turn cancels the control write itself ("controlTransferOut … The transfer was cancelled").
+ * So the loop drains this queue between reads with the stream stopped instead, serialising
+ * every access to the device onto one thread of control.
+ */
+const controlQueue: Array<() => Promise<void>> = []
+
 function post(message: FromWorker) {
   self.postMessage(message)
 }
@@ -59,6 +72,28 @@ async function start(config: CaptureConfig) {
   let lastReport = performance.now()
 
   while (running) {
+    // Drain queued control operations with the stream stopped, so their control writes
+    // never overlap the in-flight sample transfers. This is the one place the device is
+    // touched besides the read itself, which keeps every access serialised.
+    if (controlQueue.length > 0) {
+      await transport.stopStream()
+      while (controlQueue.length > 0) {
+        const op = controlQueue.shift()!
+        try {
+          await op()
+        } catch (error) {
+          post({
+            type: 'error',
+            message: `control: ${error instanceof Error ? error.message : String(error)}`,
+            fatal: false,
+          })
+        }
+      }
+      if (!running) break
+      transport.startStream()
+      continue
+    }
+
     let block: Uint8Array
     try {
       block = await transport.readSamples()
@@ -120,6 +155,7 @@ async function start(config: CaptureConfig) {
 
 async function teardown() {
   running = false
+  controlQueue.length = 0
   if (transport) {
     await transport.close().catch(() => {})
     transport = undefined
@@ -135,20 +171,27 @@ self.onmessage = async (event: MessageEvent<ToCapture>) => {
         await start(message.config)
         break
       case 'tune':
-        if (receiver) {
+        controlQueue.push(async () => {
+          if (!receiver) return
           await receiver.setFrequency(message.hz)
           // Whatever is already in flight was captured at the previous frequency.
           await receiver.resetBuffer()
-        }
+        })
         break
       case 'gain':
-        await receiver?.setGain(message.tenths)
+        controlQueue.push(async () => {
+          await receiver?.setGain(message.tenths)
+        })
         break
       case 'biasTee':
-        await receiver?.setBiasTee(message.enabled)
+        controlQueue.push(async () => {
+          await receiver?.setBiasTee(message.enabled)
+        })
         break
       case 'correction':
-        await receiver?.setFrequencyCorrection(message.ppm)
+        controlQueue.push(async () => {
+          await receiver?.setFrequencyCorrection(message.ppm)
+        })
         break
       case 'stop':
         await teardown()
