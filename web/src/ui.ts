@@ -697,8 +697,22 @@ export class ReceiverUI {
       if (this.mode === 'wfm') this.pipeline.setDeemphasis(DEFAULT_DEEMPHASIS_US)
 
       this.stopDemo()
-      this.render = await startRendering(this.pipeline, this.canvases)
-      if (!this.render.usingGpu) this.showNotice(this.render.adapterInfo, false)
+
+      // The displays are optional and must never take the receiver down with them. WebGPU
+      // can be absent or, embedded in a cross-origin-isolated iframe, throw while setting up
+      // a context — and until now that threw straight into the catch below, which stops the
+      // pipeline and, mid-initialisation, cancels the device's own control transfers ("the
+      // transfer was cancelled"), leaving no audio. Audio and capture are already running by
+      // this point, so a rendering failure is isolated here: the waterfall goes dark, the
+      // radio keeps playing.
+      try {
+        this.render = await startRendering(this.pipeline, this.canvases)
+        if (!this.render.usingGpu) this.showNotice(this.render.adapterInfo, false)
+      } catch (error) {
+        this.render = undefined
+        console.warn('sdr-bullet: displays unavailable', error)
+        this.showNotice('The GPU displays could not start here — audio is unaffected.', false)
+      }
 
       this.running = true
       this.connectButton.textContent = 'Disconnect'
