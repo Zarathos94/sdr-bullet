@@ -56,7 +56,7 @@ export interface DeviceIdentity {
   isV4: boolean
 }
 
-function identify(device: USBDevice): DeviceIdentity {
+export function identify(device: USBDevice): DeviceIdentity {
   return {
     // The descriptor accessors are nullable; normalise to undefined so the identity type
     // stays optional rather than dragging null through every consumer.

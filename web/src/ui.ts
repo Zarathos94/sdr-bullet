@@ -15,6 +15,7 @@
 
 import { DemoDisplay } from './demo.js'
 import { ScopeDisplay } from './scope.js'
+import { Constellation2D } from './constellation2d.js'
 import { Pipeline, type PipelineStatus } from './pipeline.js'
 import { startRendering, type RenderHandle } from './render.js'
 import { Scanner, SCAN_BANDS, type FoundStation, type ScanBand } from './scan.js'
@@ -122,6 +123,12 @@ export class ReceiverUI {
   private readonly demoCanvas = el('canvas', 'demo-canvas')
   private readonly scopeCanvas = el('canvas', 'scope-canvas')
   private scope: ScopeDisplay | undefined
+  // The GPU constellation and its Canvas2D fallback share the constellation view; one is
+  // shown at a time depending on whether WebGPU is driving the displays.
+  private readonly gpuConstellationWrap = el('div', 'canvas-wrap constellation-wrap')
+  private readonly const2dWrap = el('div', 'canvas-wrap const2d-wrap')
+  private readonly const2dCanvas = el('canvas', 'scope-canvas const2d-canvas')
+  private const2d: Constellation2D | undefined
 
   // Console shell: a top bar, then a workspace split into a display stage and a control rail.
   private readonly stage = el('div', 'stage')
@@ -272,15 +279,14 @@ export class ReceiverUI {
     demoWrap.append(el('div', 'canvas-label', 'Demo signal · Connect for live reception'))
     panorama.append(this.gpuCanvasWrap, demoWrap)
 
-    // Constellation — the GPU I/Q density plot.
+    // Constellation — the GPU I/Q density plot, with a Canvas2D fallback that renders the
+    // same baseband when WebGPU is unavailable (so the view is never simply blank).
     const constellation = el('div', 'disp disp-constellation')
-    const constellationWrap = el('div', 'canvas-wrap constellation-wrap')
-    constellationWrap.append(this.canvases.constellation)
-    constellationWrap.append(el('div', 'canvas-label', 'Constellation · I/Q density'))
-    constellation.append(
-      constellationWrap,
-      el('div', 'disp-hint', 'Connect the receiver to plot the constellation'),
-    )
+    this.gpuConstellationWrap.append(this.canvases.constellation)
+    this.gpuConstellationWrap.append(el('div', 'canvas-label', 'Constellation · I/Q density'))
+    this.const2dWrap.append(this.const2dCanvas)
+    this.const2dWrap.append(el('div', 'canvas-label', 'Constellation · I/Q density'))
+    constellation.append(this.gpuConstellationWrap, this.const2dWrap)
 
     // Scope — the Canvas2D baseband oscilloscope.
     const scope = el('div', 'disp disp-scope')
@@ -507,23 +513,6 @@ export class ReceiverUI {
     for (const button of this.displayTabs.querySelectorAll('button')) {
       button.classList.toggle('active', button.dataset['disp'] === mode)
     }
-    this.updateDisplayLoops()
-  }
-
-  /**
-   * Only the display currently on screen should animate. The demo and scope are Canvas2D
-   * rAF loops that each force a layout read per frame; running them while hidden is pure
-   * main-thread churn, and two of them at once is what made the UI feel choppy. The GPU
-   * render loop is left alone — it is cheap and drives the panorama when live.
-   */
-  private updateDisplayLoops() {
-    const demoWrap = this.stage.querySelector('.demo-wrap')
-    const demoShowing =
-      this.displayMode === 'panorama' && demoWrap != null && !demoWrap.classList.contains('hidden')
-    if (demoShowing) this.demo?.start()
-    else this.demo?.stop()
-    if (this.displayMode === 'scope') this.scope?.start()
-    else this.scope?.stop()
   }
 
   // -- Demo ---------------------------------------------------------------
@@ -541,16 +530,37 @@ export class ReceiverUI {
     }
   }
 
-  /** The scope runs for the life of the app — an idle sweep offline, live baseband when
-   * connected — so switching to the Scope tab is always instant and never blank. */
+  /** The scope and the 2D constellation run for the life of the app — idle offline, live
+   * baseband when connected — so switching to their tabs is always instant and never blank. */
   private ensureScope() {
-    if (this.scope) return
-    try {
-      this.scope = new ScopeDisplay(this.scopeCanvas)
-      this.scope.start()
-    } catch {
-      // No 2D context: the scope tab simply stays empty.
+    if (!this.scope) {
+      try {
+        this.scope = new ScopeDisplay(this.scopeCanvas)
+        this.scope.start()
+      } catch {
+        // No 2D context: the scope tab simply stays empty.
+      }
     }
+    if (!this.const2d) {
+      try {
+        this.const2d = new Constellation2D(this.const2dCanvas)
+        this.const2d.start()
+      } catch {
+        // No 2D context: the constellation falls back to the (possibly blank) GPU canvas.
+      }
+    }
+  }
+
+  /**
+   * Shows either the GPU displays (spectrum/waterfall stack and the GPU constellation) or
+   * their Canvas2D fallbacks (the demo spectrum and the 2D constellation). One set is always
+   * hidden, so WebGPU being available or not never leaves a view blank.
+   */
+  private setGpuDisplaysVisible(visible: boolean) {
+    this.gpuCanvasWrap.classList.toggle('hidden', !visible)
+    this.gpuConstellationWrap.classList.toggle('hidden', !visible)
+    document.querySelector('.demo-wrap')?.classList.toggle('hidden', visible)
+    this.const2dWrap.classList.toggle('hidden', visible)
   }
 
   /** The synthetic pre-connect demo. */
@@ -560,21 +570,21 @@ export class ReceiverUI {
     this.ensureScope()
     this.demo?.setSource(null)
     this.scope?.setSource(null)
-    document.querySelector('.demo-wrap')?.classList.remove('hidden')
-    this.gpuCanvasWrap.classList.add('hidden')
-    this.updateDisplayLoops()
+    this.const2d?.setSource(null)
+    this.setGpuDisplaysVisible(false)
   }
 
   /**
-   * The live 2D spectrum shown when WebGPU is unavailable or drops out — the same canvas as
-   * the demo, but fed the real spectrum so the receiver still has a working display.
+   * The live 2D displays shown when WebGPU is unavailable or drops out — the demo canvas fed
+   * the real spectrum, and the 2D constellation fed the real baseband, so the receiver keeps
+   * a working spectrum, waterfall and constellation without the GPU.
    */
   private startLiveFallback() {
     this.ensureDemo()
+    this.ensureScope()
     this.demo?.setSource(() => this.pipeline.latestSpectrum())
-    document.querySelector('.demo-wrap')?.classList.remove('hidden')
-    this.gpuCanvasWrap.classList.add('hidden')
-    this.updateDisplayLoops()
+    this.const2d?.setSource(() => this.pipeline.peekConstellation())
+    this.setGpuDisplaysVisible(false)
   }
 
   private stopDemo() {
@@ -582,8 +592,7 @@ export class ReceiverUI {
     this.demo = undefined
     this.demoResizeObserver?.disconnect()
     this.demoResizeObserver = undefined
-    document.querySelector('.demo-wrap')?.classList.add('hidden')
-    this.gpuCanvasWrap.classList.remove('hidden')
+    this.setGpuDisplaysVisible(true)
   }
 
   /** WebGPU dropped out after start-up; switch the displays to the live 2D fallback. */
@@ -836,8 +845,10 @@ export class ReceiverUI {
       // receiver down: mark it live before touching the GPU so a display failure is isolated.
       this.running = true
       this.setConnectionUi('live')
-      // Feed the scope the live baseband; it peeks the same I/Q slot the constellation drains.
+      // Feed the scope and the 2D constellation the live baseband; both peek the same I/Q
+      // slot the GPU constellation drains.
       this.scope?.setSource(() => this.pipeline.peekConstellation())
+      this.const2d?.setSource(() => this.pipeline.peekConstellation())
 
       // Try WebGPU; if it is unavailable or throws — common for WebGPU on Linux inside this
       // cross-origin-isolated frame, where the Vulkan external-semaphore share fails — fall
@@ -883,6 +894,7 @@ export class ReceiverUI {
     await this.pipeline.stop()
     this.running = false
     this.scope?.setSource(null)
+    this.const2d?.setSource(null)
     this.setConnectionUi('offline')
     if (!options.keepDemoOff) this.startDemo()
   }
@@ -1013,6 +1025,8 @@ export class ReceiverUI {
     this.stopDemo()
     this.scope?.stop()
     this.scope = undefined
+    this.const2d?.stop()
+    this.const2d = undefined
     await this.stop({ keepDemoOff: true })
     this.root.replaceChildren()
   }

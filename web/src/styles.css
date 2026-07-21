@@ -313,7 +313,8 @@ body {
 
 .demo-wrap.hidden,
 .gpu-displays.hidden,
-.rail-view.hidden {
+.rail-view.hidden,
+.canvas-wrap.hidden {
   display: none;
 }
 

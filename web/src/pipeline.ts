@@ -8,7 +8,13 @@
 import { AudioOutput, type AudioHealth } from './audio/output.js'
 import { LatestFrame, allocateRing } from './ipc/ring.js'
 import { allocateIqRing } from './ipc/iq-ring.js'
-import { requestDevice, isSupported, type DeviceIdentity } from './usb/webusb.js'
+import {
+  requestDevice,
+  grantedDevices,
+  identify,
+  isSupported,
+  type DeviceIdentity,
+} from './usb/webusb.js'
 import type {
   CaptureStatus,
   DemodModeName,
@@ -110,8 +116,23 @@ export class Pipeline {
     return { ok: true }
   }
 
-  /** Opens the device chooser. Must be called from a user gesture, on the page. */
+  /** Whether a compatible RTL-SDR has already been permitted, so connecting needs no chooser. */
+  async hasPermittedDevice(): Promise<boolean> {
+    return (await grantedDevices()).length > 0
+  }
+
+  /**
+   * Resolves the device to open. Prefers one the user has already permitted — `getDevices()`
+   * returns only granted devices and shows no UI, so a return visit connects with no chooser
+   * popping up. The chooser (`requestDevice`) is only opened to grant a *new* device, which
+   * the browser requires happen inside a user gesture on the page.
+   */
   async requestDevice(): Promise<DeviceIdentity> {
+    const permitted = await grantedDevices()
+    if (permitted[0]) {
+      this.device = identify(permitted[0])
+      return this.device
+    }
     this.device = await requestDevice()
     return this.device
   }
